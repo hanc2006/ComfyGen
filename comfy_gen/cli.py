@@ -121,6 +121,29 @@ def cmd_download(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
+def cmd_delete(args: argparse.Namespace) -> None:
+    from comfy_gen import delete_files
+
+    paths: list[str] = []
+    if args.batch:
+        with open(args.batch) as f:
+            paths = json.load(f)
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            output.error("Batch file must contain a JSON array of path strings")
+    else:
+        paths = list(args.paths or [])
+        if not paths:
+            output.error("Usage: comfy-gen delete <path>...\n  Or:  comfy-gen delete --batch <file.json>")
+
+    result = delete_files.submit_delete(
+        paths=paths,
+        timeout=args.timeout or 300,
+        endpoint_id=getattr(args, "endpoint_id", None),
+    )
+    print(json.dumps(result))
+    sys.exit(0)
+
+
 def cmd_hash(args: argparse.Namespace) -> None:
     from comfy_gen import hash_files
 
@@ -414,6 +437,47 @@ def main() -> None:
     )
     p_download.add_argument("--endpoint-id", metavar="ID", help="RunPod endpoint ID (overrides config)")
 
+    # delete
+    p_delete = subparsers.add_parser(
+        "delete",
+        help="Delete files on the RunPod network volume by path",
+        description=(
+            "Delete one or more files on the RunPod network volume. The worker\n"
+            "validates every path with realpath (symlinks + `..` followed) and\n"
+            "rejects anything that doesn't land strictly under /runpod-volume,\n"
+            "so /etc/passwd and friends are safe. Missing files are idempotent\n"
+            "— they return an error entry rather than failing the batch.\n"
+            "\n"
+            "DESTRUCTIVE: this permanently removes files from the network\n"
+            "volume. There is no trash/undo. Pair with `comfy-gen hash` and\n"
+            "`comfy-gen list` if you want to verify what you're about to remove.\n"
+            "\n"
+            "Output JSON fields:\n"
+            "  ok                 true if the batch ran (per-path errors are\n"
+            "                     non-fatal and surface in results[].error)\n"
+            "  results            Array of:\n"
+            "                       {path, deleted: true}                 on success\n"
+            "                       {path, deleted: false, error: ...}    on failure\n"
+            "                       per-path errors: 'not found',\n"
+            "                       'path outside /runpod-volume', or an OSError msg\n"
+            "\n"
+            "Examples:\n"
+            "  comfy-gen delete /runpod-volume/ComfyUI/models/loras/old.safetensors\n"
+            "  comfy-gen delete /rv/.../a.safetensors /rv/.../b.safetensors\n"
+            "  comfy-gen delete --batch paths.json   # paths.json: [\"/path/a\", ...]\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_delete.add_argument("paths", nargs="*", help="Absolute path(s) under /runpod-volume to delete")
+    p_delete.add_argument(
+        "--batch", metavar="FILE",
+        help="Path to JSON file with array of path strings (overrides positional args)",
+    )
+    p_delete.add_argument(
+        "--timeout", type=int, help="Max seconds to wait for completion (default: 300)",
+    )
+    p_delete.add_argument("--endpoint-id", metavar="ID", help="RunPod endpoint ID (overrides config)")
+
     # hash
     p_hash = subparsers.add_parser(
         "hash",
@@ -552,6 +616,7 @@ def main() -> None:
             "config": cmd_config,
             "submit": cmd_submit,
             "download": cmd_download,
+            "delete": cmd_delete,
             "hash": cmd_hash,
             "status": cmd_status,
             "cancel": cmd_cancel,
