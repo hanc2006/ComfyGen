@@ -108,6 +108,29 @@ def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
     with open(wf_file, "wb") as f:
         f.write(urllib.request.urlopen(wf_url, timeout=30).read())
 
+    # Pre-flight: validate the workflow's class_types + inputs against the
+    # endpoint's installed node set BEFORE submitting. Fails fast with every
+    # problem named in one error instead of waiting ~25 min for the worker
+    # to hit ComfyUI's own validation and return one cryptic message at a time.
+    with open(wf_file) as f:
+        workflow = json.load(f)
+    class_types = sorted({n.get("class_type") for n in workflow.values() if isinstance(n, dict) and n.get("class_type")})
+    info_result = run_cli(
+        ["comfy-gen", "object-info", *class_types,
+         "--endpoint-id", endpoint_id, "--timeout", "120"],
+        step="object_info",
+    )
+    if not info_result.get("ok"):
+        raise RuntimeError(f"object_info call failed: {info_result.get('error', info_result)}")
+    sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
+    from validate_workflow import validate  # noqa: E402  -- sibling-dir import at smoke time
+    failures = validate(workflow, info_result.get("classes", {}))
+    if failures:
+        joined = "\n  - " + "\n  - ".join(failures)
+        raise RuntimeError(f"workflow pre-flight failed ({len(failures)} issue(s)):{joined}")
+    print(f"[smoke] pre-flight validated {len(class_types)} class(es), {len(workflow)} node(s)",
+          file=sys.stderr)
+
     # Run the workflow.
     submit_result = run_cli(
         ["comfy-gen", "submit", wf_file,
