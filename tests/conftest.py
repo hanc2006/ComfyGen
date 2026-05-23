@@ -46,6 +46,9 @@ def dispatch_command():
         if command == "list_models":
             import list_handler
             return list_handler.handle(job)
+        if command == "object_info":
+            import object_info_handler
+            return object_info_handler.handle(job)
         raise ValueError(f"unknown command: {command!r}")
 
     return _dispatch
