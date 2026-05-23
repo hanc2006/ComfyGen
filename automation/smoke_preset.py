@@ -174,7 +174,12 @@ def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
         raise RuntimeError(f"object_info call failed: {info_result.get('error', info_result)}")
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
     from validate_workflow import validate  # noqa: E402  -- sibling-dir import at smoke time
-    failures = validate(workflow, info_result.get("classes", {}))
+    # Fields populated by smoke_inputs are runtime-loaded into ComfyUI/input/
+    # via `comfy-gen submit --input` AFTER object_info is queried, so their
+    # enum check would false-positive on a stale dropdown. Skip them.
+    smoke_inputs_for_skip = workflow_entry.get("smoke_inputs") or []
+    skip_enum = {(i["node_id"], i["field"]) for i in smoke_inputs_for_skip}
+    failures = validate(workflow, info_result.get("classes", {}), skip_enum_fields=skip_enum)
     if failures:
         joined = "\n  - " + "\n  - ".join(failures)
         raise RuntimeError(f"workflow pre-flight failed ({len(failures)} issue(s)):{joined}")

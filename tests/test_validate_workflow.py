@@ -119,6 +119,30 @@ def test_connection_typed_input_skipped_from_checks():
     assert validate(workflow, OBJECT_INFO) == []
 
 
+def test_skip_enum_fields_bypasses_enum_check():
+    """skip_enum_fields lets the smoke gate bypass enum checks for fields
+    populated at submit time (LoadImage / VHS_LoadVideo)."""
+    workflow = {
+        "9": {
+            "class_type": "OnnxDetectionModelLoader",
+            "inputs": {
+                "vitpose_model": "vitpose_h_wholebody_data.bin",
+                # Would normally fail enum check (not in ['vitpose_h_wholebody_data.bin'])
+                "yolo_model": "smoke_uploaded.onnx",
+            },
+        },
+    }
+    # Without skip: failure expected
+    assert len(validate(workflow, OBJECT_INFO)) == 1
+    # With skip: yolo_model bypassed → no failure
+    assert validate(workflow, OBJECT_INFO, skip_enum_fields={("9", "yolo_model")}) == []
+    # Required + class checks still run with skip (regression guard)
+    bad = {
+        "9": {"class_type": "GhostNode", "inputs": {}},
+    }
+    assert "class not installed" in validate(bad, OBJECT_INFO, skip_enum_fields={("9", "yolo_model")})[0]
+
+
 def test_multiple_failures_all_reported():
     workflow = {
         "1": {"class_type": "GhostNode", "inputs": {}},

@@ -45,16 +45,28 @@ def _enum_options(spec: object) -> list[str] | None:
     return None
 
 
-def validate(workflow: dict, object_info: dict) -> list[str]:
+def validate(
+    workflow: dict,
+    object_info: dict,
+    skip_enum_fields: set[tuple[str, str]] | None = None,
+) -> list[str]:
     """Validate `workflow` against `object_info`.
 
     Args:
         workflow: ComfyUI workflow in API format — `{node_id: {class_type, inputs}}`.
         object_info: ComfyUI's /object_info slice — `{class_type: {input: {required, optional}, ...}}`.
+        skip_enum_fields: Optional set of `(node_id, field_name)` pairs whose
+            enum check should be skipped. Use this for fields that will be
+            populated at submit time by an out-of-band mechanism (e.g. smoke
+            gate's `--input` upload to LoadImage / VHS_LoadVideo). The dropdown
+            options at object_info-query time don't include the not-yet-uploaded
+            file, so a literal enum check would false-positive. Required and
+            class-installed checks still run.
 
     Returns:
         List of failure strings (empty list = the workflow is valid).
     """
+    skip = skip_enum_fields or set()
     failures: list[str] = []
     for node_id, node in workflow.items():
         ct = node.get("class_type")
@@ -74,6 +86,9 @@ def validate(workflow: dict, object_info: dict) -> list[str]:
 
             value = provided[field_name]
             if _is_connection(value):
+                continue
+
+            if (node_id, field_name) in skip:
                 continue
 
             options = _enum_options(spec)
