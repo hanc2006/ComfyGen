@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -23,6 +24,50 @@ import time
 import urllib.request
 
 MANIFEST_URL = "https://raw.githubusercontent.com/Hearmeman24/blockflow-presets/main/manifest.json"
+
+
+def choose_workflow(preset: dict) -> dict:
+    """Return the single workflow this smoke run will exercise.
+
+    Supports both schemas:
+    - legacy: preset['workflow'] is a {name?, url, sha256, smoke_inputs?} dict
+    - current (post-sgs-ui-chf): preset['workflows'] is a list; smoke runs the FIRST entry only
+      (cheapest matrix; matches preset.tested_against in practice).
+    """
+    if preset.get("workflow"):
+        return preset["workflow"]
+    workflows = preset.get("workflows") or []
+    if not workflows:
+        raise RuntimeError("preset has neither 'workflow' nor a non-empty 'workflows' list")
+    return workflows[0]
+
+
+def fetch_smoke_inputs(smoke_inputs: list[dict], preset_id: str) -> list[tuple[str, str]]:
+    """Download + sha256-verify each fixture; return [(node_id, local_path), ...].
+
+    Used to build `comfy-gen submit --input <node_id>=<local_path>` args. Fixtures
+    are workflow-specific test inputs declared by the preset (per sgs-ui-5ir
+    schema); BlockFlow's installer ignores them.
+    """
+    out: list[tuple[str, str]] = []
+    for i, inp in enumerate(smoke_inputs):
+        node_id = inp["node_id"]
+        url = inp["url"]
+        expected_sha = inp["sha256"]
+        filename = inp["filename"]
+        local_path = f"/tmp/smoke-{preset_id}-fixture-{i}-{filename}"
+        print(f"[smoke] fetching fixture for node {node_id}: {filename}", file=sys.stderr)
+        data = urllib.request.urlopen(url, timeout=60).read()
+        actual_sha = hashlib.sha256(data).hexdigest()
+        if actual_sha != expected_sha:
+            raise RuntimeError(
+                f"smoke_inputs[{i}] sha256 mismatch for {filename}: "
+                f"expected {expected_sha}, got {actual_sha}"
+            )
+        with open(local_path, "wb") as f:
+            f.write(data)
+        out.append((node_id, local_path))
+    return out
 
 
 def fetch_preset(preset_id: str) -> dict:
@@ -102,8 +147,13 @@ def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
     print(f"[smoke] download done: {len(files)} file(s), {cached} cached, "
           f"{len(files) - cached} fresh", file=sys.stderr)
 
-    # Fetch the workflow JSON to a local file (submit takes a path).
-    wf_url = preset["workflow"]["url"]
+    # Pick the workflow + fetch its JSON. Multi-workflow presets (wan-animate)
+    # smoke only the first listed workflow (locked design from kv9; matches
+    # 'tested_against' note in practice).
+    workflow_entry = choose_workflow(preset)
+    wf_name = workflow_entry.get("name", "<unnamed>")
+    print(f"[smoke] workflow: {wf_name!r}", file=sys.stderr)
+    wf_url = workflow_entry["url"]
     wf_file = f"/tmp/smoke-{preset_id}-workflow.json"
     with open(wf_file, "wb") as f:
         f.write(urllib.request.urlopen(wf_url, timeout=30).read())
@@ -131,9 +181,20 @@ def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
     print(f"[smoke] pre-flight validated {len(class_types)} class(es), {len(workflow)} node(s)",
           file=sys.stderr)
 
+    # Fetch + sha256-verify any per-workflow smoke_input fixtures (image, video,
+    # etc.) and translate them into `--input <node_id>=<path>` args. Absent
+    # smoke_inputs is fine for zero-file workflows (qwen-image-lighting).
+    input_args: list[str] = []
+    smoke_inputs = workflow_entry.get("smoke_inputs") or []
+    if smoke_inputs:
+        fixtures = fetch_smoke_inputs(smoke_inputs, preset_id)
+        for node_id, local_path in fixtures:
+            input_args.extend(["--input", f"{node_id}={local_path}"])
+        print(f"[smoke] {len(fixtures)} smoke_input fixture(s) fetched", file=sys.stderr)
+
     # Run the workflow.
     submit_result = run_cli(
-        ["comfy-gen", "submit", wf_file,
+        ["comfy-gen", "submit", wf_file, *input_args,
          "--endpoint-id", endpoint_id, "--timeout", str(workflow_timeout)],
         step="submit",
     )
