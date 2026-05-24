@@ -12,6 +12,8 @@ logic (hashlib) against real bytes on disk.
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 
@@ -237,3 +239,59 @@ def test_partial_failure_second_entry_mismatch_removes_only_bad_file(
         ]))
     assert (models_base / "loras" / "a.safetensors").exists()
     assert not (models_base / "loras" / "b.safetensors").exists()
+
+
+# --- CLI entrypoint (_cli_main) — used by the CPU installer pod ---
+#
+# The installer pod runs `python -m download_handler --job /tmp/job.json`
+# instead of the runpod harness. The CLI must read a job dict (same shape as
+# the worker dispatch input), invoke handle(), print the result as JSON to
+# stdout, and exit 0 iff result["ok"] is truthy.
+
+def test_cli_main_reads_stdin_and_prints_result(monkeypatch, capsys, mocker):
+    job = {"input": {"command": "download", "downloads": [{"source": "url"}]}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(job)))
+    fake_handle = mocker.patch.object(
+        download_handler, "handle", return_value={"ok": True, "files": []}
+    )
+    rc = download_handler._cli_main([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert json.loads(out) == {"ok": True, "files": []}
+    fake_handle.assert_called_once_with(job)
+
+
+def test_cli_main_reads_job_file(tmp_path, capsys, mocker):
+    job = {"input": {"command": "download", "downloads": [{"source": "url"}]}}
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps(job))
+    mocker.patch.object(download_handler, "handle", return_value={"ok": True, "files": []})
+    rc = download_handler._cli_main(["--job", str(job_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert json.loads(out) == {"ok": True, "files": []}
+
+
+def test_cli_main_exits_1_when_handle_returns_not_ok(monkeypatch, capsys, mocker):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"input": {}})))
+    mocker.patch.object(download_handler, "handle", return_value={"ok": False, "error": "x"})
+    rc = download_handler._cli_main([])
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "x"}
+
+
+def test_cli_main_malformed_json_raises(monkeypatch, mocker):
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json {"))
+    mocker.patch.object(download_handler, "handle")
+    with pytest.raises(json.JSONDecodeError):
+        download_handler._cli_main([])
+
+
+def test_send_progress_is_noop_without_runpod_harness(monkeypatch):
+    # When the CLI runs the installer pod, runpod.serverless.progress_update has
+    # no live job context. The existing try/except must swallow whatever it
+    # raises so download work continues.
+    def boom(*_a, **_kw):
+        raise RuntimeError("no harness")
+    monkeypatch.setattr(download_handler.runpod.serverless, "progress_update", boom)
+    download_handler._send_progress({"id": "x"}, "msg", 50.0)  # must not raise
