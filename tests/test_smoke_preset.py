@@ -18,7 +18,12 @@ import pytest
 # Add automation/ to path so we can import smoke_preset's pure helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "automation"))
 
-from smoke_preset import choose_workflow, fetch_smoke_inputs  # noqa: E402
+from smoke_preset import (  # noqa: E402
+    choose_workflow,
+    fetch_smoke_inputs,
+    resolve_volume_for_endpoint,
+    run_install_preset,
+)
 
 
 def test_choose_workflow_picks_legacy_singular():
@@ -111,3 +116,149 @@ def test_fetch_smoke_inputs_multiple_fixtures_all_returned():
 
     assert len(result) == 2
     assert [n for n, _ in result] == ["311", "417"]
+
+
+# --- run_install_preset: line-delimited JSON event stream consumption ---
+#
+# The new `comfy-gen install-preset` emits one JSON event per stdout line
+# (not one final JSON blob). The helper drives the subprocess via Popen,
+# yields events to a sink, and returns the {files, cached, fresh} summary
+# from the terminal install_done event.
+
+import json as _json
+import subprocess as _subprocess
+
+
+def _fake_popen_with_events(events: list[dict], returncode: int = 0):
+    """Return a context-manager-friendly fake Popen yielding the given events."""
+
+    class FakePopen:
+        def __init__(self, *_a, **_kw):
+            self.stdout = iter(_json.dumps(e).encode() + b"\n" for e in events)
+            self.returncode = returncode
+            self.stderr = b""
+            self.args = _a
+            self.kwargs = _kw
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return FakePopen
+
+
+def test_run_install_preset_happy_path_returns_summary():
+    events = [
+        {"type": "pod_spawned", "pod_id": "p", "token": "t"},
+        {"type": "preflight_start"},
+        {"type": "preflight_ok", "preset_id": "qwen-image-lighting",
+         "models_count": 4, "total_bytes": 0, "volume_free_bytes": 10**12},
+        {"type": "download_start", "file_index": 0, "file": "a"},
+        {"type": "download_done",  "file_index": 0, "file": "a",
+         "cached": True,  "bytes": 1, "sha256": "x" * 64},
+        {"type": "download_start", "file_index": 1, "file": "b"},
+        {"type": "download_done",  "file_index": 1, "file": "b",
+         "cached": False, "bytes": 2, "sha256": "y" * 64},
+        {"type": "install_done", "ok": True,
+         "files": [{"filename": "a", "cached": True},
+                   {"filename": "b", "cached": False}],
+         "elapsed_sec": 37},
+    ]
+    with patch.object(_subprocess, "Popen", _fake_popen_with_events(events)):
+        out = run_install_preset(preset_id="qwen-image-lighting", volume_id="v")
+    assert out["total"] == 2
+    assert out["cached"] == 1
+    assert out["fresh"] == 1
+    assert out["elapsed_sec"] == 37
+    assert len(out["files"]) == 2
+
+
+def test_run_install_preset_install_error_raises():
+    events = [
+        {"type": "preflight_start"},
+        {"type": "preflight_ok", "preset_id": "x", "models_count": 1,
+         "total_bytes": 0, "volume_free_bytes": 10**12},
+        {"type": "download_start", "file_index": 0, "file": "a"},
+        {"type": "install_error", "stage": "download", "reason": "aria2c blew up"},
+    ]
+    with patch.object(_subprocess, "Popen", _fake_popen_with_events(events, returncode=1)):
+        with pytest.raises(RuntimeError, match="aria2c blew up"):
+            run_install_preset(preset_id="x", volume_id="v")
+
+
+def test_run_install_preset_preflight_fail_raises():
+    events = [
+        {"type": "preflight_start"},
+        {"type": "preflight_fail", "reason": "preset_id 'nope' missing"},
+    ]
+    with patch.object(_subprocess, "Popen", _fake_popen_with_events(events, returncode=1)):
+        with pytest.raises(RuntimeError, match="missing"):
+            run_install_preset(preset_id="nope", volume_id="v")
+
+
+def test_run_install_preset_no_terminal_event_raises():
+    events = [
+        {"type": "preflight_start"},
+        {"type": "preflight_ok", "preset_id": "x", "models_count": 0,
+         "total_bytes": 0, "volume_free_bytes": 0},
+    ]
+    # Exit non-zero with no install_done / install_error / preflight_fail.
+    with patch.object(_subprocess, "Popen", _fake_popen_with_events(events, returncode=2)):
+        with pytest.raises(RuntimeError, match="unexpected exit"):
+            run_install_preset(preset_id="x", volume_id="v")
+
+
+def test_run_install_preset_install_done_ok_false_raises():
+    events = [
+        {"type": "preflight_ok", "preset_id": "x", "models_count": 1,
+         "total_bytes": 0, "volume_free_bytes": 10**12},
+        {"type": "install_done", "ok": False, "files": [], "elapsed_sec": 1},
+    ]
+    with patch.object(_subprocess, "Popen", _fake_popen_with_events(events, returncode=1)):
+        with pytest.raises(RuntimeError, match="install_done.ok=False"):
+            run_install_preset(preset_id="x", volume_id="v")
+
+
+# --- resolve_volume_for_endpoint: GET /v1/endpoints/<ep> ---
+
+def test_resolve_volume_for_endpoint_returns_first_volume():
+    class FakeResp:
+        def __init__(self, payload): self.payload = _json.dumps(payload).encode()
+        def read(self): return self.payload
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    with patch("urllib.request.urlopen",
+               return_value=FakeResp({"networkVolumeIds": ["vol-abc"]})):
+        assert resolve_volume_for_endpoint("rpa_x", "ep-1") == "vol-abc"
+
+
+def test_resolve_volume_for_endpoint_empty_list_raises():
+    class FakeResp:
+        def __init__(self, payload): self.payload = _json.dumps(payload).encode()
+        def read(self): return self.payload
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    with patch("urllib.request.urlopen",
+               return_value=FakeResp({"networkVolumeIds": []})):
+        with pytest.raises(RuntimeError, match="no network volume"):
+            resolve_volume_for_endpoint("rpa_x", "ep-1")
+
+
+def test_resolve_volume_for_endpoint_singular_field_fallback():
+    """Some endpoint responses report `networkVolumeId` (singular) instead."""
+    class FakeResp:
+        def __init__(self, payload): self.payload = _json.dumps(payload).encode()
+        def read(self): return self.payload
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    with patch("urllib.request.urlopen",
+               return_value=FakeResp({"networkVolumeId": "vol-singular"})):
+        assert resolve_volume_for_endpoint("rpa_x", "ep-1") == "vol-singular"

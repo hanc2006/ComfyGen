@@ -303,6 +303,14 @@ def run(
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"type": "install_error", "stage": "health",
                           "reason": str(exc)}), file=out, flush=True)
+        # The pod never became healthy — there's nothing to inspect by
+        # leaving it alive, and the user can't reach /shutdown to drain
+        # it. DELETE directly from the orchestrator to stop billing
+        # (only when we spawned it; install-call mode skips).
+        if spawned_pod and api_key and not keep_alive:
+            delete_pod(api_key, pod_id)
+            print(json.dumps({"type": "pod_deleted", "pod_id": pod_id}),
+                  file=out, flush=True)
         return 1
 
     install_ok: bool | None = None
@@ -322,10 +330,28 @@ def run(
         install_ok = False
 
     if not keep_alive:
+        # /shutdown is a clean drain signal (stop accepting work, exit
+        # Python). It is NOT a reliable teardown — RunPod restarts the
+        # container after the Python process exits, and the in-pod
+        # self-DELETE attempt has been observed to silently fail. The
+        # orchestrator (this CLI) is the lifecycle owner: we DELETE the
+        # pod from outside, which is the only path that reliably stops
+        # billing.
         shutdown_pod(pod_id, port, pod_token)
-        if spawned_pod and api_key and install_ok is False:
-            # Pod stays alive per edge-case table when install fails, so the
-            # user can inspect logs. Skip DELETE in that branch.
-            pass
+        if spawned_pod and api_key:
+            if install_ok is False:
+                # On install_error / preflight_fail the pod stays alive for
+                # log inspection (edge-case table in bead 5f2). Skip DELETE.
+                print(json.dumps({
+                    "type": "pod_kept_alive",
+                    "pod_id": pod_id,
+                    "reason": "install failed; pod retained for log inspection",
+                }), file=out, flush=True)
+            else:
+                delete_pod(api_key, pod_id)
+                print(json.dumps({
+                    "type": "pod_deleted",
+                    "pod_id": pod_id,
+                }), file=out, flush=True)
 
     return 0 if install_ok else 1

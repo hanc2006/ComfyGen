@@ -2,9 +2,10 @@
 """Live smoke test for a single BlockFlow preset against a ComfyGen endpoint.
 
 Fetches the preset manifest, installs the preset's models on the network volume
-via `comfy-gen download`, runs the preset's workflow via `comfy-gen submit`, and
-verifies each output URL with a Range GET. Exits 0 on success, non-zero on any
-step failure. JSON status to stdout, human progress to stderr.
+via `comfy-gen install-preset` (CPU installer pod, see bead 5f2), runs the
+preset's workflow via `comfy-gen submit`, and verifies each output URL with a
+Range GET. Exits 0 on success, non-zero on any step failure. JSON status to
+stdout, human progress to stderr.
 
 Used by CircleCI as the post-build gate: one job per preset (matrix), each
 proves the freshly-deployed image actually serves that preset end-to-end.
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -79,22 +81,123 @@ def fetch_preset(preset_id: str) -> dict:
     raise RuntimeError(f"preset {preset_id!r} not in registry manifest")
 
 
-def build_downloads(preset: dict) -> list[dict]:
-    """Translate preset.models into the comfy-gen download batch shape.
+def resolve_volume_for_endpoint(api_key: str, endpoint_id: str) -> str:
+    """GET /v1/endpoints/<ep> → first network volume id.
 
-    Preset model entries use `source: "huggingface"` (a label); the download
-    handler only knows `source: "url"` and `source: "civitai"`. HF URLs are
-    plain HTTPS so they go through the url path.
+    Smoke runs the install onto whatever volume the endpoint already has
+    attached — that's the same volume the worker will see at workflow
+    time, so files written there are immediately discoverable.
     """
-    items: list[dict] = []
-    for m in preset["models"]:
-        items.append({
-            "source": "url",
-            "url": m["url"],
-            "destination_path": m["dest"],
-            "sha256": m["sha256"],
-        })
-    return items
+    url = f"https://rest.runpod.io/v1/endpoints/{endpoint_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "comfygen-smoke/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    # The REST schema has used both `networkVolumeIds: [...]` and a singular
+    # `networkVolumeId` field across versions. Accept either.
+    ids = data.get("networkVolumeIds")
+    if isinstance(ids, list) and ids:
+        if len(ids) > 1:
+            print(f"[smoke] WARN: endpoint {endpoint_id!r} has {len(ids)} "
+                  f"volumes; using first ({ids[0]!r})", file=sys.stderr)
+        return ids[0]
+    singular = data.get("networkVolumeId")
+    if singular:
+        return singular
+    raise RuntimeError(
+        f"endpoint {endpoint_id!r} has no network volume attached; "
+        f"attach a volume before running smoke"
+    )
+
+
+def run_install_preset(preset_id: str, volume_id: str,
+                       runtime_repo_ref: str | None = None,
+                       timeout: int = 3600) -> dict:
+    """Drive `comfy-gen install-preset` and consume its line-delimited JSON.
+
+    Returns `{total, cached, fresh, files, elapsed_sec, pod_id?}`. Raises
+    RuntimeError on `install_error`, `preflight_fail`, `install_done.ok==False`,
+    or non-zero exit with no terminal event. `pod_id` is populated from the
+    first `pod_spawned` event so failure surfaces are debuggable via the
+    RunPod console.
+    """
+    cmd = [
+        "comfy-gen", "install-preset",
+        "--preset-id", preset_id,
+        "--volume-id", volume_id,
+    ]
+    if runtime_repo_ref:
+        cmd += ["--runtime-repo-ref", runtime_repo_ref]
+    print(f"[smoke] install-preset: {' '.join(cmd)}", file=sys.stderr, flush=True)
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    files: list[dict] = []
+    cached = 0
+    fresh = 0
+    elapsed_sec: int | None = None
+    pod_id: str | None = None
+    terminal: dict | None = None
+    error: str | None = None
+
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        try:
+            event = json.loads(raw.decode().rstrip("\r\n"))
+        except json.JSONDecodeError:
+            continue
+        et = event.get("type")
+        if et == "pod_spawned":
+            pod_id = event.get("pod_id")
+        elif et == "download_done":
+            if event.get("cached"):
+                cached += 1
+            else:
+                fresh += 1
+        elif et == "install_done":
+            terminal = event
+            files = event.get("files", [])
+            elapsed_sec = event.get("elapsed_sec")
+            if not event.get("ok"):
+                error = f"install_done.ok=False (pod {pod_id})"
+            break
+        elif et in ("install_error", "preflight_fail"):
+            terminal = event
+            error = (
+                f"{et} (pod {pod_id}, stage={event.get('stage','?')}): "
+                f"{event.get('reason', '<no reason>')}"
+            )
+            break
+
+    proc.wait(timeout=timeout)
+    if error:
+        raise RuntimeError(error)
+    if terminal is None:
+        stderr_tail = (proc.stderr.read() if proc.stderr else b"").decode(errors="replace")[-500:]
+        raise RuntimeError(
+            f"install-preset unexpected exit ({proc.returncode}) with no "
+            f"terminal event. stderr tail:\n{stderr_tail}"
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"install-preset exit {proc.returncode} after install_done — "
+            f"likely shutdown failure. files={len(files)} pod={pod_id}"
+        )
+    return {
+        "total": len(files),
+        "cached": cached,
+        "fresh": fresh,
+        "files": files,
+        "elapsed_sec": elapsed_sec,
+        "pod_id": pod_id,
+    }
 
 
 def run_cli(cmd: list[str], step: str) -> dict:
@@ -133,26 +236,32 @@ def verify_output_url(url: str) -> dict:
         return {"status": r.status, "bytes_returned": len(body)}
 
 
-def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
+def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int,
+          runtime_repo_ref: str | None = None) -> dict:
     started = time.time()
 
     preset = fetch_preset(preset_id)
     print(f"[smoke] preset {preset_id!r} loaded: {len(preset['models'])} model(s)", file=sys.stderr)
 
-    # Install models — dedup will skip anything already on the volume with the matching sha256.
-    dl_batch = build_downloads(preset)
-    dl_file = f"/tmp/smoke-{preset_id}-downloads.json"
-    with open(dl_file, "w") as f:
-        json.dump(dl_batch, f)
-    dl_result = run_cli(
-        ["comfy-gen", "download", "--batch", dl_file,
-         "--endpoint-id", endpoint_id, "--timeout", "5400"],
-        step="download",
+    # Install models on a CPU installer pod (bead 5f2) — dedup will skip
+    # anything already on the volume with the matching sha256. The CLI
+    # resolves the preset itself; no batch-file translation here.
+    api_key = os.environ.get("RUNPOD_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("RUNPOD_API_KEY env required to resolve endpoint volume")
+    volume_id = resolve_volume_for_endpoint(api_key, endpoint_id)
+    print(f"[smoke] installing onto volume {volume_id!r}", file=sys.stderr)
+    install_result = run_install_preset(
+        preset_id=preset_id,
+        volume_id=volume_id,
+        runtime_repo_ref=runtime_repo_ref,
     )
-    files = dl_result.get("files", [])
-    cached = sum(1 for f in files if f.get("cached"))
-    print(f"[smoke] download done: {len(files)} file(s), {cached} cached, "
-          f"{len(files) - cached} fresh", file=sys.stderr)
+    files = install_result["files"]
+    cached = install_result["cached"]
+    fresh = install_result["fresh"]
+    print(f"[smoke] install done: {len(files)} file(s), {cached} cached, "
+          f"{fresh} fresh, pod={install_result.get('pod_id')}, "
+          f"elapsed={install_result.get('elapsed_sec')}s", file=sys.stderr)
 
     # Pick the workflow + fetch its JSON. Multi-workflow presets (wan-animate)
     # smoke only the first listed workflow (locked design from kv9; matches
@@ -225,7 +334,10 @@ def smoke(preset_id: str, endpoint_id: str, workflow_timeout: int) -> dict:
         "ok": True,
         "preset_id": preset_id,
         "endpoint_id": endpoint_id,
-        "downloads": {"total": len(files), "cached": cached, "fresh": len(files) - cached},
+        "volume_id": volume_id,
+        "installer_pod_id": install_result.get("pod_id"),
+        "downloads": {"total": len(files), "cached": cached, "fresh": fresh},
+        "install_elapsed_seconds": install_result.get("elapsed_sec"),
         "outputs": verified,
         "workflow_elapsed_seconds": submit_result.get("elapsed_seconds"),
         "smoke_elapsed_seconds": round(time.time() - started, 1),
@@ -241,10 +353,14 @@ def main() -> None:
     p.add_argument("--endpoint-id", required=True, help="RunPod endpoint to test against")
     p.add_argument("--workflow-timeout", type=int, default=1800,
                    help="Max seconds for the workflow run (default 1800)")
+    p.add_argument("--runtime-repo-ref", metavar="REF",
+                   help="Override RUNTIME_REPO_REF on the installer pod (used "
+                        "pre-merge to test feature branches of serverless-runtime)")
     args = p.parse_args()
 
     try:
-        result = smoke(args.preset_id, args.endpoint_id, args.workflow_timeout)
+        result = smoke(args.preset_id, args.endpoint_id, args.workflow_timeout,
+                       runtime_repo_ref=args.runtime_repo_ref)
         print(json.dumps(result))
         sys.exit(0)
     except Exception as e:
