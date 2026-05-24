@@ -26,7 +26,7 @@ def mocks(monkeypatch):
         "stream_raises": None,
     }
 
-    def fake_spawn(api_key, image, volume_id, token, name="x", port=3000):
+    def fake_spawn(api_key, image, volume_id, token, name="x", port=3000, **_):
         state["spawn_calls"].append({
             "api_key": api_key, "image": image, "volume_id": volume_id,
             "token": token, "port": port,

@@ -89,6 +89,7 @@ def cmd_install_preset(args: argparse.Namespace) -> None:
         keep_alive=args.keep_alive,
         civitai_token=args.civitai_token,
         hf_token=args.hf_token,
+        runtime_repo_ref=args.runtime_repo_ref,
     )
     sys.exit(rc)
 
@@ -733,6 +734,7 @@ def main() -> None:
     p_install.add_argument("--health-timeout-sec", type=int, default=180, help="Max seconds to wait for the pod's /health to come up (default: 180)")
     p_install.add_argument("--civitai-token", help="Optional CivitAI token forwarded to the worker via /install body")
     p_install.add_argument("--hf-token", help="Optional HuggingFace token forwarded to the worker via /install body")
+    p_install.add_argument("--runtime-repo-ref", metavar="REF", help="Override RUNTIME_REPO_REF (git ref the pod clones at boot)")
 
     # install-call (bead 5f2) — drive an existing pod without spawning
     p_install_call = subparsers.add_parser(

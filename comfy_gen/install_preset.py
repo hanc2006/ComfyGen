@@ -71,20 +71,28 @@ def spawn_installer_pod(
     token: str,
     name: str = "comfygen-installer",
     port: int = DEFAULT_PORT,
+    cpu_flavor_ids: list[str] | None = None,
+    vcpu_count: int = 2,
+    runtime_repo_ref: str | None = None,
 ) -> dict:
     """POST /v1/pods to create a CPU pod with installer_server running.
 
     Returns the parsed JSON from RunPod, which must include `id`. Raises
     RuntimeError on a non-2xx response.
     """
+    env: dict[str, str] = {"INSTALLER_TOKEN": token, "RUNPOD_API_KEY": api_key}
+    if runtime_repo_ref:
+        env["RUNTIME_REPO_REF"] = runtime_repo_ref
     body = {
         "name": name,
         "imageName": image,
         "containerDiskInGb": 5,
         "volumeMountPath": "/workspace",
         "networkVolumeId": volume_id,
-        "ports": f"{port}/http",
-        "env": {"INSTALLER_TOKEN": token},
+        "ports": [f"{port}/http"],
+        "cpuFlavorIds": cpu_flavor_ids or ["cpu5c", "cpu3c", "cpu5g", "cpu3g"],
+        "vcpuCount": vcpu_count,
+        "env": env,
     }
     status, payload = _http(
         "POST", "https://rest.runpod.io/v1/pods",
@@ -171,6 +179,7 @@ def run(
     keep_alive: bool = False,
     civitai_token: str | None = None,
     hf_token: str | None = None,
+    runtime_repo_ref: str | None = None,
     out=sys.stdout,
 ) -> int:
     """Drive an install end-to-end. Prints one JSON event per line to `out`."""
@@ -188,6 +197,7 @@ def run(
         spawn_result = spawn_installer_pod(
             api_key=api_key, image=image, volume_id=volume_id,
             token=pod_token, port=port,
+            runtime_repo_ref=runtime_repo_ref,
         )
         pod_id = spawn_result["id"]
         spawned_pod = True
