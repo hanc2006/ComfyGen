@@ -23,6 +23,7 @@ def mocks(monkeypatch):
         "health_raises": None,
         "events": [],
         "shutdowns": [],
+        "deletes": [],
         "stream_raises": None,
     }
 
@@ -45,10 +46,14 @@ def mocks(monkeypatch):
     def fake_shutdown(pod_id, port, token):
         state["shutdowns"].append(pod_id)
 
+    def fake_delete(api_key, pod_id):
+        state["deletes"].append(pod_id)
+
     monkeypatch.setattr(install_preset, "spawn_installer_pod", fake_spawn)
     monkeypatch.setattr(install_preset, "wait_for_health", fake_health)
     monkeypatch.setattr(install_preset, "stream_install", fake_stream)
     monkeypatch.setattr(install_preset, "shutdown_pod", fake_shutdown)
+    monkeypatch.setattr(install_preset, "delete_pod", fake_delete)
 
     # Config: stub runpod_api_key so spawn path runs.
     monkeypatch.setattr(install_preset.config, "load", lambda: {"runpod_api_key": "rpa_x"})
@@ -78,8 +83,12 @@ def test_happy_path_spawn_install_shutdown_exit_0(mocks):
     lines = _run_lines(buf)
     assert lines[0]["type"] == "pod_spawned"
     assert lines[0]["pod_id"] == "pod-abc"
-    assert lines[-1]["type"] == "install_done"
+    assert lines[-1]["type"] == "pod_deleted"
+    assert lines[-1]["pod_id"] == "pod-abc"
     assert mocks["shutdowns"] == ["pod-abc"]
+    # Orchestrator-side DELETE is the only reliable teardown — /shutdown alone
+    # leaves the container in RunPod's restart loop. See bead d9v.
+    assert mocks["deletes"] == ["pod-abc"]
 
 
 def test_health_timeout_exits_1_and_does_not_call_stream(mocks):
@@ -93,6 +102,20 @@ def test_health_timeout_exits_1_and_does_not_call_stream(mocks):
     lines = _run_lines(buf)
     err = next(l for l in lines if l["type"] == "install_error")
     assert err["stage"] == "health"
+    # Critical: a never-healthy pod we spawned still costs money. DELETE.
+    assert mocks["deletes"] == ["pod-abc"]
+
+
+def test_health_timeout_on_install_call_does_not_delete(mocks):
+    """install-call (caller-owned pod) must NOT be deleted even on health fail."""
+    mocks["health_raises"] = "not healthy"
+    buf = io.StringIO()
+    rc = install_preset.run(
+        preset_id="qwen", volume_id=None, pod_id="caller-pod",
+        token="t", out=buf,
+    )
+    assert rc == 1
+    assert mocks["deletes"] == []
 
 
 def test_install_error_event_propagates_exit_1(mocks):
@@ -107,6 +130,9 @@ def test_install_error_event_propagates_exit_1(mocks):
     assert rc == 1
     lines = _run_lines(buf)
     assert any(l["type"] == "install_error" for l in lines)
+    # Pod stays alive for log inspection per edge-case table — no DELETE.
+    assert mocks["deletes"] == []
+    assert any(l["type"] == "pod_kept_alive" for l in lines)
 
 
 def test_keep_alive_skips_shutdown(mocks):
@@ -118,6 +144,8 @@ def test_keep_alive_skips_shutdown(mocks):
     )
     assert rc == 0
     assert mocks["shutdowns"] == []
+    # --keep-alive is also "don't DELETE" — the whole point is the pod stays.
+    assert mocks["deletes"] == []
 
 
 def test_install_call_no_spawn(mocks):
@@ -130,6 +158,8 @@ def test_install_call_no_spawn(mocks):
     assert rc == 0
     assert mocks["spawn_calls"] == [], "spawn must not be called when pod-id given"
     assert mocks["shutdowns"] == ["existing-pod"]
+    # install-call: orchestrator doesn't own the pod — don't DELETE it.
+    assert mocks["deletes"] == []
     lines = _run_lines(buf)
     # No pod_spawned line in install-call mode.
     assert not any(l["type"] == "pod_spawned" for l in lines)
