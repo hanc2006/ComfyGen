@@ -75,9 +75,28 @@ def cmd_submit(args: argparse.Namespace) -> None:
     sys.exit(1 if not result.get("ok", True) else 0)
 
 
+def _resolve_install_tokens(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Env-first, argv-fallback token resolution for install-preset/install-call.
+
+    BlockFlow now passes tokens via COMFY_GEN_CIVITAI_TOKEN / COMFY_GEN_HF_TOKEN
+    so they don't show up in `ps` output. The --civitai-token / --hf-token
+    flags stay for one release as a fallback, with a stderr deprecation warning.
+    """
+    env_civitai = os.environ.get("COMFY_GEN_CIVITAI_TOKEN")
+    env_hf = os.environ.get("COMFY_GEN_HF_TOKEN")
+    if args.civitai_token or args.hf_token:
+        print(
+            "warning: --civitai-token/--hf-token on argv is deprecated; "
+            "use COMFY_GEN_CIVITAI_TOKEN / COMFY_GEN_HF_TOKEN env vars instead",
+            file=sys.stderr,
+        )
+    return env_civitai or args.civitai_token, env_hf or args.hf_token
+
+
 def cmd_install_preset(args: argparse.Namespace) -> None:
     from comfy_gen import install_preset
 
+    civitai_token, hf_token = _resolve_install_tokens(args)
     rc = install_preset.run(
         preset_id=args.preset_id,
         volume_id=args.volume_id,
@@ -87,8 +106,8 @@ def cmd_install_preset(args: argparse.Namespace) -> None:
         port=args.port,
         health_timeout_sec=args.health_timeout_sec,
         keep_alive=args.keep_alive,
-        civitai_token=args.civitai_token,
-        hf_token=args.hf_token,
+        civitai_token=civitai_token,
+        hf_token=hf_token,
         runtime_repo_ref=args.runtime_repo_ref,
     )
     sys.exit(rc)
@@ -97,6 +116,7 @@ def cmd_install_preset(args: argparse.Namespace) -> None:
 def cmd_install_call(args: argparse.Namespace) -> None:
     from comfy_gen import install_preset
 
+    civitai_token, hf_token = _resolve_install_tokens(args)
     rc = install_preset.run(
         preset_id=args.preset_id,
         volume_id=None,
@@ -104,8 +124,8 @@ def cmd_install_call(args: argparse.Namespace) -> None:
         token=args.token,
         port=args.port,
         keep_alive=args.keep_alive,
-        civitai_token=args.civitai_token,
-        hf_token=args.hf_token,
+        civitai_token=civitai_token,
+        hf_token=hf_token,
     )
     sys.exit(rc)
 
@@ -720,6 +740,12 @@ def main() -> None:
             "  0 — install_done.ok == true\n"
             "  1 — install_error, preflight_fail, health timeout, or stream error\n"
             "\n"
+            "Token env vars (preferred over --civitai-token / --hf-token):\n"
+            "  COMFY_GEN_CIVITAI_TOKEN  CivitAI API token forwarded to the worker\n"
+            "  COMFY_GEN_HF_TOKEN       HuggingFace token forwarded to the worker\n"
+            "Argv flags still work for one release as a fallback; using them emits\n"
+            "a stderr deprecation warning. Env vars keep tokens out of `ps` output.\n"
+            "\n"
             "Examples:\n"
             "  comfy-gen install-preset --preset-id qwen-image-lighting --volume-id 7etzak7vfp\n"
             "  comfy-gen install-preset --preset-id wan-video --volume-id <vid> --keep-alive\n"
@@ -732,8 +758,8 @@ def main() -> None:
     p_install.add_argument("--port", type=int, default=3000, help="Pod port (default: 3000)")
     p_install.add_argument("--keep-alive", action="store_true", help="Skip the /shutdown call so the pod stays available for follow-up installs")
     p_install.add_argument("--health-timeout-sec", type=int, default=180, help="Max seconds to wait for the pod's /health to come up (default: 180)")
-    p_install.add_argument("--civitai-token", help="Optional CivitAI token forwarded to the worker via /install body")
-    p_install.add_argument("--hf-token", help="Optional HuggingFace token forwarded to the worker via /install body")
+    p_install.add_argument("--civitai-token", help="DEPRECATED — pass via COMFY_GEN_CIVITAI_TOKEN env var instead. Argv exposes the token to `ps`/process listings; the env var path keeps it out. Flag kept for one release for back-compat; emits a stderr warning when used.")
+    p_install.add_argument("--hf-token", help="DEPRECATED — pass via COMFY_GEN_HF_TOKEN env var instead. Same rationale as --civitai-token.")
     p_install.add_argument("--runtime-repo-ref", metavar="REF", help="Override RUNTIME_REPO_REF (git ref the pod clones at boot)")
 
     # install-call (bead 5f2) — drive an existing pod without spawning
@@ -757,8 +783,8 @@ def main() -> None:
     p_install_call.add_argument("--preset-id", required=True, help="Preset id from the manifest")
     p_install_call.add_argument("--port", type=int, default=3000)
     p_install_call.add_argument("--keep-alive", action="store_true")
-    p_install_call.add_argument("--civitai-token")
-    p_install_call.add_argument("--hf-token")
+    p_install_call.add_argument("--civitai-token", help="DEPRECATED — pass via COMFY_GEN_CIVITAI_TOKEN env var instead.")
+    p_install_call.add_argument("--hf-token", help="DEPRECATED — pass via COMFY_GEN_HF_TOKEN env var instead.")
 
     args = parser.parse_args()
 
