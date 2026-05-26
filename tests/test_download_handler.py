@@ -211,6 +211,41 @@ def test_unknown_source_raises(fake_aria2c, models_base):
         download_handler.handle(_job([{"source": "ftp", "url": "x"}]))
 
 
+def test_huggingface_source_aliases_url(fake_aria2c, models_base):
+    """`source: "huggingface"` is functionally identical to `source: "url"` —
+    aria2c against the given URL. The blockflow-presets schema emits it; the
+    handler must accept it."""
+    result = download_handler.handle(_job([
+        {"source": "huggingface",
+         "url": "https://huggingface.co/m.safetensors",
+         "dest": "loras",
+         "sha256": REAL_SHA},
+    ]))
+    assert result["ok"] is True
+    f = result["files"][0]
+    assert f["filename"] == "m.safetensors"
+    assert f["sha256"] == REAL_SHA
+    assert f["cached"] is False
+    assert fake_aria2c["calls"] == 1
+
+
+def test_huggingface_source_dedup_matches_url_path(fake_aria2c, models_base):
+    """Pre-existing file with matching sha256 must skip aria2c regardless of
+    whether the source is 'url' or 'huggingface'."""
+    dest = models_base / "loras"
+    dest.mkdir()
+    (dest / "m.safetensors").write_bytes(REAL_BYTES)
+    result = download_handler.handle(_job([
+        {"source": "huggingface",
+         "url": "https://huggingface.co/m.safetensors",
+         "dest": "loras",
+         "sha256": REAL_SHA},
+    ]))
+    assert result["ok"] is True
+    assert result["files"][0]["cached"] is True
+    assert fake_aria2c["calls"] == 0
+
+
 def test_url_source_missing_url_raises(fake_aria2c, models_base):
     with pytest.raises(RuntimeError, match="'url' required"):
         download_handler.handle(_job([{"source": "url", "dest": "loras"}]))
