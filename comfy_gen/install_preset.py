@@ -301,7 +301,9 @@ def run(
     try:
         wait_for_health(pod_id, port, timeout_sec=health_timeout_sec)
     except Exception as exc:  # noqa: BLE001
+        from comfy_gen import _install_error_codes as _ec
         print(json.dumps({"type": "install_error", "stage": "health",
+                          "error_code": _ec.HEALTH_TIMEOUT,
                           "reason": str(exc)}), file=out, flush=True)
         # The pod never became healthy — there's nothing to inspect by
         # leaving it alive, and the user can't reach /shutdown to drain
@@ -324,7 +326,9 @@ def run(
             elif event["type"] in ("install_error", "preflight_fail"):
                 install_ok = False
     except Exception as exc:  # noqa: BLE001
+        from comfy_gen import _install_error_codes as _ec
         print(json.dumps({"type": "install_error", "stage": "stream",
+                          "error_code": _ec.STREAM_ERROR,
                           "reason": f"{type(exc).__name__}: {exc}"}),
               file=out, flush=True)
         install_ok = False
