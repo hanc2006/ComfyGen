@@ -258,6 +258,17 @@ def cmd_info(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
+def cmd_version(args: argparse.Namespace) -> None:
+    from comfy_gen import version_check
+
+    result = version_check.submit_version(
+        timeout=args.timeout or 60,
+        endpoint_id=getattr(args, "endpoint_id", None),
+    )
+    print(json.dumps(result))
+    sys.exit(0 if result.get("ok") else 1)
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     from comfy_gen import init
     init.run(args)
@@ -717,6 +728,32 @@ def main() -> None:
     )
     p_info.add_argument("--endpoint-id", metavar="ID", help="RunPod endpoint ID (overrides config)")
 
+    # version (bead bmq.2 / A.7.6) — BlockFlow semver gate against preset's comfygen_min_version
+    p_version = subparsers.add_parser(
+        "version",
+        help="Query the worker version reported by a serverless endpoint",
+        description=(
+            "Submit a `health` job to the endpoint and report the worker's version. Used\n"
+            "by BlockFlow to gate preset installs against a preset-declared\n"
+            "`comfygen_min_version`. Cheap call — no GPU/model work.\n"
+            "\n"
+            "Output JSON fields:\n"
+            "  ok                 true on success\n"
+            "  worker_version     Semver string reported by the worker (e.g. \"0.2.0\")\n"
+            "\n"
+            "Exit codes:\n"
+            "  0 — ok=true\n"
+            "  1 — ok=false or unreachable endpoint\n"
+            "\n"
+            "Examples:\n"
+            "  comfy-gen version\n"
+            "  comfy-gen version --endpoint-id abc123\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_version.add_argument("--timeout", type=int, help="Max seconds to wait for completion (default: 60)")
+    p_version.add_argument("--endpoint-id", metavar="ID", help="RunPod endpoint ID (overrides config)")
+
     # install-preset (bead 5f2)
     p_install = subparsers.add_parser(
         "install-preset",
@@ -801,6 +838,7 @@ def main() -> None:
             "cancel": cmd_cancel,
             "list": cmd_list,
             "info": cmd_info,
+            "version": cmd_version,
             "install-preset": cmd_install_preset,
             "install-call": cmd_install_call,
         }[args.command](args)
