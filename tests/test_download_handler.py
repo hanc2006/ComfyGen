@@ -229,6 +229,59 @@ def test_huggingface_source_aliases_url(fake_aria2c, models_base):
     assert fake_aria2c["calls"] == 1
 
 
+def test_dest_with_file_path_is_split_defensively(fake_aria2c, models_base):
+    """If a caller passes the full file path in `dest` (foot-gun seen in the
+    wild from BlockFlow's GPU-fallback installer), the handler defensively
+    splits it the same way `destination_path` would. Without this, makedirs
+    explodes on the existing file at that path."""
+    target = models_base / "text_encoders" / "foo.safetensors"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(REAL_BYTES)
+    result = download_handler.handle(_job([
+        {"source": "url",
+         "url": "https://example.com/foo.safetensors",
+         "dest": "text_encoders/foo.safetensors",
+         "sha256": REAL_SHA},
+    ]))
+    assert result["ok"] is True
+    f = result["files"][0]
+    assert f["cached"] is True
+    assert f["dest"] == "text_encoders"
+    assert f["filename"] == "foo.safetensors"
+    assert fake_aria2c["calls"] == 0
+
+
+def test_dest_subfolder_only_still_works(fake_aria2c, models_base):
+    """Regression: `dest` as a plain subfolder must keep working (the canonical
+    API shape). The defensive normalization only kicks in when `dest` looks
+    like a file path."""
+    result = download_handler.handle(_job([
+        {"source": "url",
+         "url": "https://example.com/m.safetensors",
+         "dest": "loras",
+         "sha256": REAL_SHA},
+    ]))
+    assert result["ok"] is True
+    assert result["files"][0]["dest"] == "loras"
+    assert result["files"][0]["filename"] == "m.safetensors"
+
+
+def test_dest_with_explicit_filename_skips_normalization(fake_aria2c, models_base):
+    """If caller passes BOTH `dest` (with slashes) AND `filename` explicitly,
+    trust them — they knew what they were doing. No defensive split."""
+    result = download_handler.handle(_job([
+        {"source": "url",
+         "url": "https://example.com/m.safetensors",
+         "dest": "loras/sub",
+         "filename": "m.safetensors",
+         "sha256": REAL_SHA},
+    ]))
+    assert result["ok"] is True
+    f = result["files"][0]
+    assert f["dest"] == "loras/sub"
+    assert f["filename"] == "m.safetensors"
+
+
 def test_huggingface_source_dedup_matches_url_path(fake_aria2c, models_base):
     """Pre-existing file with matching sha256 must skip aria2c regardless of
     whether the source is 'url' or 'huggingface'."""
