@@ -508,7 +508,13 @@ def main() -> None:
         "--filename", help="Output filename (URL mode only; derived from URL if omitted)",
     )
     p_download.add_argument(
-        "--timeout", type=int, help="Max seconds to wait for completion (default: 600)",
+        "--timeout", type=int,
+        help=(
+            "Max seconds to wait for completion (default: 600). Plumbed to both "
+            "the orchestrator polling loop AND the worker's per-subprocess "
+            "(aria2c, civitai-downloader) timeouts. BlockFlow computes this from "
+            "the preset's disk_size_estimate_gb as 300 + size_gb * 60."
+        ),
     )
     p_download.add_argument(
         "--batch", metavar="FILE",

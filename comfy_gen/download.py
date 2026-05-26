@@ -62,6 +62,12 @@ def submit_download(
     }
     if civitai_token:
         payload["input"]["civitai_token"] = civitai_token
+    # Pass the orchestrator-side timeout to the worker so its per-subprocess
+    # timeouts (aria2c, civitai-downloader) scale with the polling timeout.
+    # Without this, BlockFlow's --timeout flag is cosmetic — the worker's
+    # hardcoded subprocess cap would kill long downloads before the
+    # orchestrator's polling loop knows anything happened.
+    payload["input"]["timeout_sec"] = int(timeout)
 
     # Submit to RunPod
     output.log(f"Submitting download job ({len(downloads)} file(s))...")
