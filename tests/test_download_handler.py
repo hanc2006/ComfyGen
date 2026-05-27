@@ -48,16 +48,28 @@ def fake_aria2c(mocker, models_base):
     class FakeProc:
         def __init__(self, argv, **_kw):
             state["calls"] += 1
-            # argv looks like: aria2c -d <dir> -o <name> ... <url>
+            # argv looks like: aria2c -d <dir> -o <name> ... [--checksum=sha-256=<hex>] <url>
             dest_dir = argv[argv.index("-d") + 1]
             filename = argv[argv.index("-o") + 1]
             path = os.path.join(dest_dir, filename)
             os.makedirs(dest_dir, exist_ok=True)
             with open(path, "wb") as f:
                 f.write(state["payload"])
-            # Popen interface bits used by _download_url
-            self.stdout = iter([])
+
+            # Emulate aria2c --checksum=sha-256=<hex> in-flight verification:
+            # if the supplied checksum doesn't match what we just wrote, exit
+            # non-zero (caller deletes the corrupt file). Mirrors real aria2c.
+            import hashlib
             self.returncode = state["returncode"]
+            checksum_arg = next(
+                (a for a in argv if a.startswith("--checksum=sha-256=")), None,
+            )
+            if checksum_arg:
+                expected = checksum_arg.split("=", 2)[2].lower()
+                actual = hashlib.sha256(state["payload"]).hexdigest()
+                if expected != actual:
+                    self.returncode = 32  # aria2c's exit code on checksum fail
+            self.stdout = iter([])
 
         def wait(self, timeout=None):
             return self.returncode
@@ -227,6 +239,58 @@ def test_huggingface_source_aliases_url(fake_aria2c, models_base):
     assert f["sha256"] == REAL_SHA
     assert f["cached"] is False
     assert fake_aria2c["calls"] == 1
+
+
+def test_url_sha256_skips_post_download_rehash(fake_aria2c, models_base, mocker):
+    """With expected_sha + aria2c --checksum, the post-download _sha256_file
+    re-hash must not run — aria2c verifies in-flight, that's the whole win."""
+    spy = mocker.spy(download_handler, "_sha256_file")
+    result = download_handler.handle(_job([
+        {
+            "source": "url",
+            "url": "https://example.com/m.safetensors",
+            "dest": "loras",
+            "sha256": REAL_SHA,
+        },
+    ]))
+    assert result["ok"] is True
+    f = result["files"][0]
+    assert f["sha256"] == REAL_SHA.lower()
+    # Critical: zero post-download hash calls when aria2c handles --checksum.
+    assert spy.call_count == 0
+
+
+def test_url_passes_expected_sha_to_aria2c_checksum_flag(fake_aria2c, models_base, mocker):
+    """The --checksum=sha-256=<hex> arg must reach the subprocess."""
+    seen_argv = []
+    real_proc_class = mocker.patch.object(
+        download_handler.subprocess, "Popen",
+        side_effect=lambda argv, **k: (seen_argv.append(argv) or _PassthroughProc(argv)),
+    )
+
+    class _PassthroughProc:
+        def __init__(self, argv):
+            dest_dir = argv[argv.index("-d") + 1]
+            filename = argv[argv.index("-o") + 1]
+            path = os.path.join(dest_dir, filename)
+            os.makedirs(dest_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(REAL_BYTES)
+            self.stdout = iter([])
+            self.returncode = 0
+        def wait(self, timeout=None):
+            return 0
+
+    # Re-bind the closure after defining the class
+    real_proc_class.side_effect = lambda argv, **k: (seen_argv.append(argv) or _PassthroughProc(argv))
+
+    download_handler.handle(_job([
+        {"source": "url", "url": "https://example.com/m.safetensors",
+         "dest": "loras", "sha256": REAL_SHA},
+    ]))
+    assert seen_argv, "Popen must have been called"
+    flat = " ".join(seen_argv[0])
+    assert f"--checksum=sha-256={REAL_SHA.lower()}" in flat
 
 
 def test_dest_with_file_path_is_split_defensively(fake_aria2c, models_base):
