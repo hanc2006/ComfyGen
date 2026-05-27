@@ -13,7 +13,10 @@ file is verified by aria2c during the download, same as URL/HF.
 
 from __future__ import annotations
 
+import io
+import json
 import os
+import urllib.error
 
 import pytest
 
@@ -173,3 +176,98 @@ def test_metadata_lookup_token_forwarded(patched, monkeypatch):
     }
     download_handler._download_civitai("1", str(tmp_path))
     assert seen["metadata_calls"][0]["token"] == "api-token-abc"
+
+
+def test_metadata_lookup_retries_transient_http_error(monkeypatch):
+    import download_handler
+
+    calls = {"count": 0}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def read(self):
+            return json.dumps({
+                "files": [{
+                    "primary": True,
+                    "name": "m.safetensors",
+                    "hashes": {"SHA256": "a" * 64},
+                    "downloadUrl": "https://civitai.com/api/download/models/1",
+                }],
+            }).encode()
+
+    def fake_urlopen(_req, timeout):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.HTTPError(
+                url="https://civitai.com/api/v1/model-versions/1",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=io.BytesIO(b"try again later"),
+            )
+        return _Resp()
+
+    monkeypatch.setattr(download_handler.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(download_handler.time, "sleep", lambda _seconds: None)
+
+    meta = download_handler._civitai_version_metadata("1", token="tok")
+
+    assert calls["count"] == 2
+    assert meta["filename"] == "m.safetensors"
+
+
+def test_metadata_lookup_error_preserves_http_status_and_body(monkeypatch, tmp_path):
+    import download_handler
+
+    def fake_urlopen(_req, timeout):
+        raise urllib.error.HTTPError(
+            url="https://civitai.com/api/v1/model-versions/2960578",
+            code=403,
+            msg="Forbidden",
+            hdrs={},
+            fp=io.BytesIO(b"token lacks access"),
+        )
+
+    monkeypatch.setattr(download_handler.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError) as exc:
+        download_handler._download_civitai("2960578", str(tmp_path))
+
+    msg = str(exc.value)
+    assert "HTTP 403 Forbidden" in msg
+    assert "token lacks access" in msg
+
+
+def test_metadata_failure_uses_caller_filename_and_sha_fallback(monkeypatch, tmp_path):
+    import download_handler
+
+    seen = {}
+
+    def fake_metadata(_version_id, token=None):
+        raise download_handler.CivitaiMetadataError("HTTP 503 Service Unavailable")
+
+    def fake_download_url(**kwargs):
+        seen.update(kwargs)
+        path = os.path.join(kwargs["dest_dir"], kwargs["filename"])
+        os.makedirs(kwargs["dest_dir"], exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x")
+        return {"filename": kwargs["filename"], "path": path, "size_mb": 0.0}
+
+    monkeypatch.setattr(download_handler, "_civitai_version_metadata", fake_metadata)
+    monkeypatch.setattr(download_handler, "_download_url", fake_download_url)
+
+    info = download_handler._download_civitai(
+        "2960578",
+        str(tmp_path),
+        expected_sha="A" * 64,
+        fallback_filename="mopPro_v21.safetensors",
+    )
+
+    assert info["filename"] == "mopPro_v21.safetensors"
+    assert info["sha256"] == "a" * 64
+    assert seen["url"] == "https://civitai.com/api/download/models/2960578"
+    assert seen["expected_sha"] == "a" * 64
