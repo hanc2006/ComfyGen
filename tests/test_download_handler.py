@@ -555,6 +555,33 @@ def test_progress_callback_omitted_keeps_legacy_behavior(fake_aria2c, models_bas
     assert seen, "legacy progress_update path must still fire when no callback supplied"
 
 
+def test_runpod_progress_reports_completed_count_for_cached_batch(models_base, monkeypatch):
+    """Parallel cached hits must report completed count, not input index."""
+    dest = models_base / "loras"
+    dest.mkdir()
+    names = ["a.safetensors", "b.safetensors", "c.safetensors", "d.safetensors"]
+    for name in names:
+        (dest / name).write_bytes(REAL_BYTES)
+
+    seen = []
+    monkeypatch.setattr(
+        download_handler.runpod.serverless,
+        "progress_update",
+        lambda _job, payload: seen.append(payload),
+    )
+
+    result = download_handler.handle(_job([
+        {"source": "url", "url": f"https://example.com/{name}",
+         "dest": "loras", "sha256": REAL_SHA}
+        for name in names
+    ]))
+
+    assert result["ok"] is True
+    cached = [p for p in seen if p["message"].startswith("Cached ")]
+    assert [p["percent"] for p in cached] == [25.0, 50.0, 75.0, 100.0]
+    assert cached[-1]["message"].startswith("Cached 4/4:")
+
+
 
 # --- parallelism (download manager) ---
 
