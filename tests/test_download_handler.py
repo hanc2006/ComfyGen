@@ -35,6 +35,8 @@ def models_base(tmp_path, monkeypatch):
     base = tmp_path / "models"
     base.mkdir()
     monkeypatch.setattr(download_handler, "MODELS_BASE", str(base))
+    monkeypatch.setattr(download_handler, "HASH_CACHE_PATH", str(tmp_path / ".model-hash-cache.json"))
+    download_handler._hash_cache.clear()
     return base
 
 
@@ -83,6 +85,17 @@ def fake_aria2c(mocker, models_base):
 
 def _job(downloads):
     return {"id": "test-job-xyz12345", "input": {"downloads": downloads}}
+
+
+def test_hash_cache_path_follows_volume_root():
+    assert (
+        download_handler._hash_cache_path_for_models_base("/runpod-volume/ComfyUI/models")
+        == "/runpod-volume/.model-hash-cache.json"
+    )
+    assert (
+        download_handler._hash_cache_path_for_models_base("/workspace/ComfyUI/models")
+        == "/workspace/.model-hash-cache.json"
+    )
 
 
 # --- backwards compatibility: no sha256 ---
@@ -156,6 +169,54 @@ def test_preexisting_matching_file_skips_download(fake_aria2c, models_base):
     assert f["cached"] is True
     assert f["sha256"] == REAL_SHA
     assert fake_aria2c["calls"] == 0, "aria2c must NOT be called when file already matches"
+
+
+def test_preexisting_matching_hash_cache_skips_file_hash(fake_aria2c, models_base, mocker):
+    dest = models_base / "loras"
+    dest.mkdir()
+    target = dest / "m.safetensors"
+    target.write_bytes(b"large existing bytes")
+    st = target.stat()
+    download_handler._hash_cache[str(target)] = {
+        "sha256": REAL_SHA,
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+    }
+    spy = mocker.spy(download_handler, "_sha256_file")
+
+    result = download_handler.handle(_job([
+        {
+            "source": "url",
+            "url": "https://example.com/m.safetensors",
+            "dest": "loras",
+            "sha256": REAL_SHA,
+        },
+    ]))
+
+    assert result["ok"] is True
+    assert result["files"][0]["cached"] is True
+    assert fake_aria2c["calls"] == 0
+    assert spy.call_count == 0
+
+
+def test_successful_checksum_download_persists_hash_cache(fake_aria2c, models_base, mocker):
+    spy = mocker.spy(download_handler, "_sha256_file")
+
+    result = download_handler.handle(_job([
+        {
+            "source": "url",
+            "url": "https://example.com/m.safetensors",
+            "dest": "loras",
+            "sha256": REAL_SHA,
+        },
+    ]))
+
+    path = result["files"][0]["path"]
+    st = os.stat(path)
+    entry = download_handler._hash_cache[path]
+    assert entry == {"sha256": REAL_SHA, "size": st.st_size, "mtime": st.st_mtime}
+    assert os.path.exists(download_handler.HASH_CACHE_PATH)
+    assert spy.call_count == 0
 
 
 def test_preexisting_file_wrong_hash_triggers_redownload(fake_aria2c, models_base):
