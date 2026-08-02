@@ -43,6 +43,16 @@ OBJECT_INFO = {
             "required": {"samples": ["LATENT"], "vae": ["VAE"]},
         },
     },
+    # Dynamic (autogrow) input: ComfyUI declares `values` as required, but the
+    # API-format workflow serialises each slot as `values.a`, `values.b`, ...
+    "ComfyMathExpression": {
+        "input": {
+            "required": {
+                "expression": ["STRING", {"default": ""}],
+                "values": ["MATCH_TYPE"],
+            },
+        },
+    },
 }
 
 
@@ -161,3 +171,22 @@ def test_multiple_failures_all_reported():
     assert "GhostNode" in joined
     assert "missing required input 'yolo_model'" in joined
     assert "missing.onnx" in joined
+
+
+def test_dynamic_input_slots_satisfy_required():
+    """`values.a` satisfies required `values` — the ltx-2-3 preset's real shape."""
+    workflow = {
+        "267:259": {
+            "class_type": "ComfyMathExpression",
+            "inputs": {"expression": "a/2", "values.a": ["267:258", 0]},
+        },
+    }
+    assert validate(workflow, OBJECT_INFO) == []
+
+
+def test_dynamic_input_with_no_slots_still_fails():
+    workflow = {
+        "1": {"class_type": "ComfyMathExpression", "inputs": {"expression": "a/2"}},
+    }
+    failures = validate(workflow, OBJECT_INFO)
+    assert failures == ["Node 1 (ComfyMathExpression): missing required input 'values'"]

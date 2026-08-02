@@ -79,6 +79,12 @@ def validate(
 
         for field_name, spec in required.items():
             if field_name not in provided:
+                # Dynamic (autogrow) inputs: ComfyUI declares one required
+                # field, the API format serialises each wired slot as
+                # `<field>.<slot>` (e.g. ComfyMathExpression's `values.a`).
+                # Any slot counts as provided; the enum check can't apply.
+                if any(k.startswith(field_name + ".") for k in provided):
+                    continue
                 failures.append(
                     f"Node {node_id} ({ct}): missing required input '{field_name}'"
                 )
