@@ -18,6 +18,7 @@ serverless-docker/
 serverless-runtime/
 AGENTS.md
 CLAUDE.md
+/.claude/
 docs/brain/
 
 # Beads / Dolt files (added by bd init)
