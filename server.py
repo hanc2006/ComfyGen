@@ -1,259 +1,187 @@
 #!/usr/bin/env python3
-"""RunPod-style compatibility server for ComfyGen.
+"""RunPod-compatible HTTP server for a dedicated ComfyUI pod.
 
-This server exposes the RunPod-compatible HTTP interface and delegates to the
-local `worker.py` implementation instead of the RunPod serverless backend.
+Runs next to a long-lived ComfyUI instance and exposes the same job API as a
+RunPod serverless endpoint, so `comfy-gen submit` works against the pod by
+setting `api_base_url` (see README). Jobs are executed by worker.py.
 
-Routes exposed:
-- POST /run
-- POST /v2/<endpoint_id>/run
-- GET /status/<job_id>
-- GET /v2/<endpoint_id>/status/<job_id>
-- POST /cancel/<job_id>
-- POST /v2/<endpoint_id>/cancel/<job_id>
-- GET /health
+Routes (the /v2/<endpoint_id> prefix is optional and the ID is ignored):
+  POST /run                 -> {"id", "status"}
+  POST /runsync             -> job envelope once finished (or still running after --runsync-timeout)
+  GET  /status/<job_id>     -> {"id", "status", "output", "error", "delayTime", "executionTime"}
+  POST /cancel/<job_id>
+  GET  /health              -> unauthenticated; 503 if ComfyUI is unreachable
+
+Every route except /health requires `Authorization: Bearer $COMFYGEN_API_TOKEN`.
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
-import tempfile
+import os
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
-from worker import cancel as worker_cancel, status as worker_status, submit as worker_submit
+import worker
 
-
-def _json_response(payload: dict[str, Any], status: int = 200) -> tuple[bytes, int]:
-    body = json.dumps(payload).encode("utf-8")
-    return body, status
+MAX_BODY_BYTES = 50 * 1024 * 1024
+RUNSYNC_TIMEOUT_SECONDS = 90
 
 
-def _parse_endpoint_id(path: str) -> str | None:
-    """Extract endpoint ID from /v2/<endpoint_id>/... routes."""
-    parts = [p for p in path.split("/") if p]
+def _route(path: str) -> list[str]:
+    """Split a path into segments, dropping an optional /v2/<endpoint_id> prefix."""
+    parts = [p for p in urlsplit(path).path.split("/") if p]
     if len(parts) >= 3 and parts[0] == "v2":
-        return parts[1]
-    return None
+        parts = parts[2:]
+    return parts
 
 
-def _parse_job_id(path: str) -> str | None:
-    """Extract job ID from /status/<job_id> or /v2/.../status/<job_id>."""
-    parts = [p for p in path.split("/") if p]
-    if len(parts) >= 2 and parts[0] == "status":
-        return parts[1]
-    if len(parts) >= 4 and parts[0] == "v2" and parts[2] == "status":
-        return parts[3]
-    if len(parts) >= 4 and parts[0] == "v2" and parts[2] == "cancel":
-        return parts[3]
-    return None
-
-
-def _normalize_workflow_payload(body: Any) -> dict[str, Any]:
-    """Normalize RunPod-like payload into a dict expected by the local worker."""
+def _parse_submit(body: Any) -> dict[str, Any]:
+    """Validate a RunPod-style {"input": {...}} body and return worker.submit kwargs."""
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
-
-    payload = body.get("input") if isinstance(body.get("input"), dict) else body
+    payload = body.get("input", body)
     if not isinstance(payload, dict):
-        raise ValueError("Request must contain an 'input' object or equivalent JSON payload")
+        raise ValueError("'input' must be a JSON object")
 
     workflow = payload.get("workflow")
-    if workflow is None:
-        workflow = body.get("workflow")
-    if workflow is None:
-        raise ValueError("Missing workflow JSON in request body")
-    if not isinstance(workflow, dict):
-        raise ValueError("workflow must be a JSON object")
+    if not isinstance(workflow, dict) or not workflow:
+        raise ValueError("Missing 'workflow' object in input")
+    if not any(isinstance(n, dict) and "class_type" in n for n in workflow.values()):
+        raise ValueError("Workflow is not in ComfyUI API format (no class_type found)")
 
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-        json.dump(workflow, fh)
-        workflow_path = fh.name
+    file_inputs = payload.get("file_inputs") or {}
+    overrides = payload.get("overrides") or {}
+    if not isinstance(file_inputs, dict):
+        raise ValueError("'file_inputs' must be an object")
+    if not isinstance(overrides, dict):
+        raise ValueError("'overrides' must be an object")
 
-    file_inputs = payload.get("file_inputs")
-    if file_inputs is None:
-        file_inputs = body.get("file_inputs")
-    if file_inputs is None:
-        file_inputs = {}
-
-    resolved_inputs: dict[str, str] = {}
-    for node_id, value in file_inputs.items():
-        if isinstance(value, str):
-            resolved_inputs[node_id] = value
-            continue
-        if isinstance(value, dict):
-            if "local_path" in value and isinstance(value["local_path"], str):
-                resolved_inputs[node_id] = value["local_path"]
-                continue
-            if "path" in value and isinstance(value["path"], str):
-                resolved_inputs[node_id] = value["path"]
-                continue
-            if "url" in value and isinstance(value["url"], str):
-                remote_url = value["url"]
-                filename = value.get("filename") or Path(remote_url).name or f"{node_id}_input"
-                with tempfile.NamedTemporaryFile("wb", suffix="_" + filename, delete=False) as tmp:
-                    req = Request(remote_url, headers={"User-Agent": "comfy-gen-compat-server/1.0"})
-                    with urlopen(req, timeout=120) as resp:
-                        tmp.write(resp.read())
-                    resolved_inputs[node_id] = tmp.name
-                continue
-        raise ValueError(f"Unsupported file input payload for node {node_id}: {value!r}")
-
-    overrides = payload.get("overrides")
-    if overrides is None:
-        overrides = body.get("overrides")
-    if overrides is None:
-        overrides = {}
-
-    timeout = payload.get("timeout")
-    if timeout is None:
-        timeout = body.get("timeout")
-    if timeout is None:
-        timeout = 1200
-
-    poll_interval = payload.get("poll_interval")
-    if poll_interval is None:
-        poll_interval = body.get("poll_interval")
-    if poll_interval is None:
-        poll_interval = 3
+    try:
+        timeout = int(payload.get("timeout") or worker.JOB_TIMEOUT_SECONDS)
+        poll_interval = float(payload.get("poll_interval") or 1.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid timeout/poll_interval: {exc}") from None
 
     return {
-        "workflow_path": workflow_path,
-        "file_inputs": resolved_inputs,
+        "workflow": workflow,
+        "file_inputs": file_inputs,
         "overrides": overrides,
         "timeout": timeout,
         "poll_interval": poll_interval,
     }
 
 
-class CompatRequestHandler(BaseHTTPRequestHandler):
-    server_version = "comfy-gen-compat-server/1.0"
+class Handler(BaseHTTPRequestHandler):
+    server_version = "comfygen-pod-server/2.0"
+    api_token: str | None = None
+    runsync_timeout: float = RUNSYNC_TIMEOUT_SECONDS
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
-        return
-
-    def _read_json_body(self) -> Any:
-        length_header = self.headers.get("Content-Length")
-        if length_header is None:
-            return {}
-        try:
-            length = int(length_header)
-        except ValueError as exc:
-            raise ValueError("Invalid Content-Length header") from exc
-
-        raw = self.rfile.read(length)
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
-
-    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
-        body, code = _json_response(payload, status)
-        self.send_response(code)
+    def _send_json(self, payload: Any, status: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_error(self, message: str, status: int = 400) -> None:
+    def _send_error(self, message: str, status: int) -> None:
         self._send_json({"error": message}, status)
 
-    def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+    def _authorized(self) -> bool:
+        if not self.api_token:
+            return True
+        header = self.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), self.api_token):
+            return True
+        self._send_error("Unauthorized", 401)
+        return False
 
-        if path == "/health":
-            self._send_json({"ok": True, "status": "healthy"})
+    def _read_json(self) -> Any:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            raise ValueError("Request body too large")
+        raw = self.rfile.read(length) if length else b""
+        return json.loads(raw) if raw else {}
+
+    def _send_job(self, env: dict[str, Any] | None, job_id: str) -> None:
+        if env is None:
+            self._send_error(f"Unknown job: {job_id}", 404)
+        else:
+            self._send_json(env)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parts = _route(self.path)
+        if parts == ["health"]:
+            healthy = worker.comfyui_healthy()
+            self._send_json({"ok": healthy, "comfyui": worker.COMFYUI_BASE_URL}, 200 if healthy else 503)
             return
-
-        job_id = _parse_job_id(path)
-        if job_id is None:
-            self._send_error(f"Unsupported GET path: {path}", 404)
+        if not self._authorized():
             return
+        if len(parts) == 2 and parts[0] == "status":
+            self._send_job(worker.status(parts[1]), parts[1])
+            return
+        self._send_error(f"Unsupported GET path: {self.path}", 404)
 
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return
+        parts = _route(self.path)
         try:
-            result = worker_status(job_id)
-            self._send_json(result)
+            if parts in (["run"], ["runsync"]):
+                kwargs = _parse_submit(self._read_json())
+                result = worker.submit(**kwargs)
+                if parts == ["runsync"]:
+                    result = worker.wait(result["id"], timeout=self.runsync_timeout)
+                self._send_json(result)
+                return
+            if len(parts) == 2 and parts[0] == "cancel":
+                self._send_job(worker.cancel(parts[1]), parts[1])
+                return
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_error(str(exc), 400)
+            return
         except Exception as exc:
-            self._send_error(str(exc), 500)
-
-    def do_POST(self) -> None:
-        path = urlsplit(self.path).path
-
-        try:
-            body = self._read_json_body()
-        except Exception as exc:
-            self._send_error(f"Invalid JSON body: {exc}", 400)
+            self.log_error("unhandled error on %s: %r", self.path, exc)
+            self._send_error(f"Internal error: {exc}", 500)
             return
-
-        if path in {"/run", "/v2/run"}:
-            self._handle_submit(body)
-            return
-
-        if path.startswith("/v2/") and path.endswith("/run"):
-            self._handle_submit(body)
-            return
-
-        if path in {"/cancel", "/v2/cancel"}:
-            self._handle_cancel(body)
-            return
-
-        if path.startswith("/v2/") and path.endswith("/cancel"):
-            self._handle_cancel(body)
-            return
-
-        self._send_error(f"Unsupported POST path: {path}", 404)
-
-    def _handle_submit(self, body: Any) -> None:
-        try:
-            prepared = _normalize_workflow_payload(body)
-            result = worker_submit(
-                workflow_path=prepared["workflow_path"],
-                file_inputs=prepared["file_inputs"] or None,
-                overrides=prepared["overrides"] or None,
-                timeout=int(prepared["timeout"]),
-                poll_interval=int(prepared["poll_interval"]),
-                endpoint_id=None,
-            )
-            self._send_json(result)
-        except Exception as exc:
-            self._send_error(str(exc), 500)
-
-    def _handle_cancel(self, body: Any) -> None:
-        job_id = None
-        if isinstance(body, dict):
-            job_id = body.get("job_id") or body.get("id")
-        if job_id is None:
-            job_id = _parse_job_id(self.path)
-        if job_id is None:
-            self._send_error("Missing job_id", 400)
-            return
-
-        try:
-            result = worker_cancel(job_id)
-            self._send_json(result)
-        except Exception as exc:
-            self._send_error(str(exc), 500)
+        self._send_error(f"Unsupported POST path: {self.path}", 404)
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
-    server = ThreadingHTTPServer((host, port), CompatRequestHandler)
-    print(f"ComfyGen compatibility server listening on http://{host}:{port}")
+def run_server(host: str, port: int, api_token: str | None) -> None:
+    Handler.api_token = api_token
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"ComfyGen pod server on http://{host}:{port} -> ComfyUI at {worker.COMFYUI_BASE_URL}", file=sys.stderr)
+    if not api_token:
+        print("WARNING: running without authentication (--insecure)", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
+        pass
     finally:
         server.server_close()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run a RunPod-compatible compatibility server for ComfyGen backed by the local worker.py."
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RunPod-compatible API server for a dedicated ComfyUI pod.")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Listen port (default: 8000)")
+    parser.add_argument(
+        "--insecure", action="store_true",
+        help="Allow running without COMFYGEN_API_TOKEN (anyone with the URL can use the GPU)",
+    )
     args = parser.parse_args()
-    run_server(host=args.host, port=args.port)
+
+    token = os.environ.get("COMFYGEN_API_TOKEN", "").strip() or None
+    if token is None and not args.insecure:
+        parser.error("COMFYGEN_API_TOKEN is not set. Set it, or pass --insecure for local testing.")
+    run_server(args.host, args.port, token)
+
+
+if __name__ == "__main__":
+    main()

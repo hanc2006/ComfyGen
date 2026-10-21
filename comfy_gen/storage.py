@@ -48,8 +48,8 @@ def upload_input(local_path: str, config: dict[str, Any] | None = None) -> str:
     return _upload_s3(local_path, config)
 
 
-def _upload_s3(local_path: str, config: dict[str, Any]) -> str:
-    """Upload to S3-compatible storage and return a pre-signed URL."""
+def _client(config: dict[str, Any]) -> tuple[Any, str]:
+    """Build a boto3 S3 client from config. Returns (client, bucket)."""
     try:
         import boto3
         from botocore.config import Config
@@ -85,7 +85,12 @@ def _upload_s3(local_path: str, config: dict[str, Any]) -> str:
     if endpoint_url:
         client_kwargs["endpoint_url"] = endpoint_url
 
-    client = boto3.client("s3", **client_kwargs)
+    return boto3.client("s3", **client_kwargs), bucket
+
+
+def _upload_s3(local_path: str, config: dict[str, Any]) -> str:
+    """Upload to S3-compatible storage and return a pre-signed URL."""
+    client, bucket = _client(config)
 
     # Content-addressed key to skip re-uploads
     ext = Path(local_path).suffix
@@ -103,3 +108,29 @@ def _upload_s3(local_path: str, config: dict[str, Any]) -> str:
         ExpiresIn=3600,
     )
     return url
+
+
+def upload_output(
+    data: bytes,
+    filename: str,
+    config: dict[str, Any] | None = None,
+    expires_in: int = 86400,
+) -> str:
+    """Upload generated output bytes to S3 and return a pre-signed URL.
+
+    Used by the pod worker (worker.py) to hand ComfyUI outputs back to the
+    client the same way the serverless worker does.
+    """
+    if config is None:
+        from comfy_gen.config import load
+        config = load()
+
+    client, bucket = _client(config)
+    file_hash = hashlib.md5(data).hexdigest()[:12]
+    key = f"comfy-gen/outputs/{file_hash}_{Path(filename).name}"
+    client.put_object(Bucket=bucket, Key=key, Body=data)
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in,
+    )
