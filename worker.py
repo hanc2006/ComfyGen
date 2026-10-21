@@ -2,15 +2,17 @@
 """Local ComfyUI worker for a dedicated RunPod GPU pod.
 
 This worker keeps ComfyUI running once, and communicates with the local
-ComfyUI server via the official SDK. It exposes a RunPod-style job API
-used by server.py:
+ComfyUI server via the official SDK when available, with a raw HTTP fallback
+for compatibility with different ComfyUI versions.
+
+It exposes a RunPod-style job API used by server.py:
 - submit(workflow_path, ...)
 - status(job_id)
 - cancel(job_id)
 
 Requirements:
 - ComfyUI must already be running at http://127.0.0.1:8188
-- Python SDK installed: pip install comfyui
+- Optional: pip install comfyui
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib import request
 
 try:
     from comfyui import Client
@@ -76,6 +79,21 @@ def _json_load(path: str) -> dict[str, Any]:
     return data
 
 
+def _http_json(method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 10) -> Any:
+    url = f"{COMFYUI_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    data = None
+    headers = {"Content-Type": "application/json", "User-Agent": "comfygen-worker/1.0"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = request.Request(url, data=data, headers=headers, method=method.upper())
+    with request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8")
+        if not text:
+            return {}
+        return json.loads(text)
+
+
 def _extract_prompt_id(result: Any) -> str | None:
     if isinstance(result, dict):
         for key in ("prompt_id", "id", "job_id"):
@@ -110,6 +128,12 @@ def _extract_status(history_result: Any) -> str:
             value = history_result["data"].get("status")
             if isinstance(value, str):
                 return value.upper()
+        for nested_key in history_result:
+            nested = history_result[nested_key]
+            if isinstance(nested, dict):
+                nested_status = nested.get("status")
+                if isinstance(nested_status, str):
+                    return nested_status.upper()
     if hasattr(history_result, "status"):
         return str(getattr(history_result, "status")).upper()
     if hasattr(history_result, "state"):
@@ -126,6 +150,11 @@ def _extract_outputs(history_result: Any) -> dict[str, Any]:
             for key in ("outputs", "result"):
                 if key in history_result["data"] and isinstance(history_result["data"][key], dict):
                     return history_result["data"][key]
+        for nested in history_result.values():
+            if isinstance(nested, dict):
+                for key in ("outputs", "result"):
+                    if key in nested and isinstance(nested[key], dict):
+                        return nested[key]
     if hasattr(history_result, "outputs"):
         outputs = getattr(history_result, "outputs")
         if isinstance(outputs, dict):
@@ -135,67 +164,71 @@ def _extract_outputs(history_result: Any) -> dict[str, Any]:
 
 def _check_local_comfyui_health() -> bool:
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"{COMFYUI_BASE_URL}/system_stats",
-            headers={"User-Agent": "comfygen-worker/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
+        _http_json("GET", "/system_stats", timeout=5)
+        return True
     except Exception:
         return False
 
 
 def _client() -> Any:
-    if Client is None:
-        raise RuntimeError(
-            "The official ComfyUI Python SDK is not installed. "
-            "Install it with: pip install comfyui"
-        )
-    return Client(base_url=COMFYUI_BASE_URL)
+    if Client is not None:
+        return Client(base_url=COMFYUI_BASE_URL)
+    return None
 
 
 def _submit_to_comfyui(workflow: dict[str, Any]) -> Any:
     client = _client()
-    methods = ["queue_prompt", "prompt"]
-    for method_name in methods:
-        if hasattr(client, method_name):
-            method = getattr(client, method_name)
-            try:
-                return method(workflow)
-            except TypeError:
-                if method_name == "queue_prompt":
-                    return method({"prompt": workflow})
-                raise
-    raise RuntimeError("ComfyUI SDK does not expose a supported prompt submission method")
+    if client is not None:
+        methods = ["queue_prompt", "prompt"]
+        for method_name in methods:
+            if hasattr(client, method_name):
+                method = getattr(client, method_name)
+                try:
+                    return method(workflow)
+                except TypeError:
+                    if method_name == "queue_prompt":
+                        return method({"prompt": workflow})
+                    raise
+
+    return _http_json("POST", "/prompt", {"prompt": workflow}, timeout=60)
 
 
 def _read_history(job: Job) -> Any:
     client = _client()
-    for method_name in ("get_history", "history"):
-        if hasattr(client, method_name):
-            method = getattr(client, method_name)
-            try:
-                result = method(job.prompt_id)
-                return result
-            except TypeError:
+    if client is not None:
+        for method_name in ("get_history", "history"):
+            if hasattr(client, method_name):
+                method = getattr(client, method_name)
                 try:
-                    return method()
+                    return method(job.prompt_id)
+                except TypeError:
+                    try:
+                        return method()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
-    raise RuntimeError(f"ComfyUI SDK has no history method for prompt {job.prompt_id}")
+
+    return _http_json("GET", f"/history/{job.prompt_id}", timeout=30)
+
+
+def _interrupt(job: Job) -> None:
+    client = _client()
+    if client is not None and hasattr(client, "interrupt"):
+        try:
+            client.interrupt()
+            return
+        except Exception:
+            pass
+
+    try:
+        _http_json("POST", "/interrupt", {}, timeout=10)
+    except Exception:
+        pass
 
 
 def _apply_overrides(workflow: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    """
-    Apply a simple nodal override map:
-    {
-      "7": {"seed": 42, "steps": 20},
-      "10": {"clip_skip": 2}
-    }
-    """
+    """Apply a simple nodal override map."""
     result = json.loads(json.dumps(workflow))
     for node_id, updates in overrides.items():
         if not isinstance(updates, dict):
@@ -238,8 +271,8 @@ def _job_runner(job: Job) -> None:
 
             try:
                 history_result = _read_history(job)
-                status = _extract_status(history_result)
-                status_upper = status.upper()
+                status_name = _extract_status(history_result)
+                status_upper = status_name.upper()
 
                 if status_upper in ("COMPLETED", "SUCCESS", "FINISHED"):
                     outputs = _extract_outputs(history_result)
@@ -285,7 +318,7 @@ def submit(
     poll_interval: int = 3,
     endpoint_id: str | None = None,
 ) -> dict[str, str]:
-    """Submit a job to the local ComfyUI server and return RunPod-style payload."""
+    """Submit a job to the local ComfyUI server and return a RunPod-style payload."""
     job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
@@ -308,20 +341,13 @@ def status(job_id: str, endpoint_id: str | None = None) -> dict[str, Any]:
     if job is None:
         return {"job_id": job_id, "status": "UNKNOWN"}
 
-    response: dict[str, Any] = {
-        "job_id": job_id,
-        "status": job.status,
-    }
-
+    response: dict[str, Any] = {"job_id": job_id, "status": job.status}
     if job.output:
         response.update(job.output)
-
     if job.error is not None:
         response["error"] = job.error
-
     if job.status == "IN_PROGRESS":
         response["output"] = {"message": "ComfyUI is running"}
-
     return response
 
 
@@ -334,14 +360,7 @@ def cancel(job_id: str, endpoint_id: str | None = None) -> dict[str, Any]:
     job.status = "CANCELLED"
     job.completed_at = time.time()
     job.error = "Cancelled by user"
-
-    try:
-        client = _client()
-        if hasattr(client, "interrupt"):
-            client.interrupt()
-    except Exception:
-        pass
-
+    _interrupt(job)
     return {"job_id": job_id, "status": "cancelled"}
 
 
@@ -351,7 +370,6 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8001, help="Port to listen on")
     args = parser.parse_args()
 
-    import socketserver
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
