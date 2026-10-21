@@ -22,28 +22,24 @@ comfy-gen submit ──HTTPS──> server.py :8000 (on the pod) ──HTTP─�
 
 ### On the pod: `runpod-start.sh`
 
+Clone the repo on the pod, set the environment, and run the script that ships in the repo root:
+
 ```bash
-#!/bin/bash
-set -euo pipefail
-
-# Required: shared API token (clients send it as "Authorization: Bearer <token>")
-: "${COMFYGEN_API_TOKEN:?set COMFYGEN_API_TOKEN in the pod environment}"
-# Required for outputs: S3-compatible storage (same variables as the CLI)
-: "${AWS_ACCESS_KEY_ID:?}" "${AWS_SECRET_ACCESS_KEY:?}" "${S3_BUCKET:?}"
-# Optional: S3_ENDPOINT_URL (R2/B2/MinIO), S3_REGION, COMFYUI_BASE_URL
-
+git clone https://github.com/hanc2006/ComfyGen.git /workspace/ComfyGen
 cd /workspace/ComfyGen
-python -m pip install -e . boto3
 
-# Start ComfyUI once and keep it alive
-(cd /workspace/ComfyUI && nohup python main.py --listen 127.0.0.1 --port 8188 >/tmp/comfyui.log 2>&1 &)
+export COMFYGEN_API_TOKEN=<long random secret>   # clients send it as Bearer token
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... S3_BUCKET=...
+# optional: S3_ENDPOINT_URL (R2/B2/MinIO), S3_REGION, COMFYUI_DIR (default /workspace/ComfyUI)
 
-# Wait until ComfyUI answers instead of sleeping a fixed time
-until curl -fsS http://127.0.0.1:8188/system_stats >/dev/null; do sleep 2; done
-
-nohup python server.py --host 0.0.0.0 --port 8000 >/tmp/comfygen-server.log 2>&1 &
-sleep 1 && curl -fsS http://127.0.0.1:8000/health
+./runpod-start.sh
 ```
+
+The script installs ComfyGen and boto3, then starts ComfyUI on `127.0.0.1:8188`. If a
+ComfyUI is already running there (for example, started by the pod template), it uses that
+one. It waits until ComfyUI answers, then starts `server.py` on port 8000 and checks
+`/health`. Logs go to `/tmp/comfyui.log` and `/tmp/comfygen-server.log`. If you run the
+script again, it restarts the server.
 
 Expose only port `8000` through RunPod (`https://<pod_id>-8000.proxy.runpod.net`).
 ComfyUI stays bound to localhost.
