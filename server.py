@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """RunPod-style compatibility server for ComfyGen.
 
-This file exposes the same HTTP surface that the RunPod serverless API expects:
+This server exposes the RunPod-compatible HTTP interface and delegates to the
+local `worker.py` implementation instead of the RunPod serverless backend.
+
+Routes exposed:
 - POST /run
 - POST /v2/<endpoint_id>/run
 - GET /status/<job_id>
@@ -9,14 +12,6 @@ This file exposes the same HTTP surface that the RunPod serverless API expects:
 - POST /cancel/<job_id>
 - POST /v2/<endpoint_id>/cancel/<job_id>
 - GET /health
-
-Internally it delegates to the existing functions in `comfy_gen.serverless`:
-- `serverless.submit(...)`
-- `serverless.status(...)`
-- `serverless.cancel(...)`
-
-This is a compatibility shim: it preserves the RunPod request/response shape,
-while reusing the project's existing job submission logic.
 """
 
 from __future__ import annotations
@@ -30,7 +25,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from comfy_gen import serverless
+from worker import cancel as worker_cancel, status as worker_status, submit as worker_submit
 
 
 def _json_response(payload: dict[str, Any], status: int = 200) -> tuple[bytes, int]:
@@ -59,7 +54,7 @@ def _parse_job_id(path: str) -> str | None:
 
 
 def _normalize_workflow_payload(body: Any) -> dict[str, Any]:
-    """Normalize RunPod-like payload into a dict expected by `serverless.submit`."""
+    """Normalize RunPod-like payload into a dict expected by the local worker."""
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
 
@@ -126,17 +121,12 @@ def _normalize_workflow_payload(body: Any) -> dict[str, Any]:
     if poll_interval is None:
         poll_interval = 3
 
-    endpoint_id = payload.get("endpoint_id")
-    if endpoint_id is None:
-        endpoint_id = body.get("endpoint_id")
-
     return {
         "workflow_path": workflow_path,
         "file_inputs": resolved_inputs,
         "overrides": overrides,
         "timeout": timeout,
         "poll_interval": poll_interval,
-        "endpoint_id": endpoint_id,
     }
 
 
@@ -144,7 +134,6 @@ class CompatRequestHandler(BaseHTTPRequestHandler):
     server_version = "comfy-gen-compat-server/1.0"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
-        # Silence noisy default logging to keep service output clean.
         return
 
     def _read_json_body(self) -> Any:
@@ -184,9 +173,8 @@ class CompatRequestHandler(BaseHTTPRequestHandler):
             self._send_error(f"Unsupported GET path: {path}", 404)
             return
 
-        endpoint_id = _parse_endpoint_id(path)
         try:
-            result = serverless.status(job_id, endpoint_id=endpoint_id)
+            result = worker_status(job_id)
             self._send_json(result)
         except Exception as exc:
             self._send_error(str(exc), 500)
@@ -201,42 +189,39 @@ class CompatRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path in {"/run", "/v2/run"}:
-            self._handle_submit(body, endpoint_id=None)
+            self._handle_submit(body)
             return
 
         if path.startswith("/v2/") and path.endswith("/run"):
-            self._handle_submit(body, endpoint_id=_parse_endpoint_id(path))
+            self._handle_submit(body)
             return
 
         if path in {"/cancel", "/v2/cancel"}:
-            self._handle_cancel(body, endpoint_id=None)
+            self._handle_cancel(body)
             return
 
         if path.startswith("/v2/") and path.endswith("/cancel"):
-            self._handle_cancel(body, endpoint_id=_parse_endpoint_id(path))
+            self._handle_cancel(body)
             return
 
         self._send_error(f"Unsupported POST path: {path}", 404)
 
-    def _handle_submit(self, body: Any, endpoint_id: str | None) -> None:
+    def _handle_submit(self, body: Any) -> None:
         try:
             prepared = _normalize_workflow_payload(body)
-            if endpoint_id is not None:
-                prepared["endpoint_id"] = endpoint_id
-
-            result = serverless.submit(
+            result = worker_submit(
                 workflow_path=prepared["workflow_path"],
                 file_inputs=prepared["file_inputs"] or None,
                 overrides=prepared["overrides"] or None,
                 timeout=int(prepared["timeout"]),
                 poll_interval=int(prepared["poll_interval"]),
-                endpoint_id=prepared["endpoint_id"],
+                endpoint_id=None,
             )
             self._send_json(result)
         except Exception as exc:
             self._send_error(str(exc), 500)
 
-    def _handle_cancel(self, body: Any, endpoint_id: str | None) -> None:
+    def _handle_cancel(self, body: Any) -> None:
         job_id = None
         if isinstance(body, dict):
             job_id = body.get("job_id") or body.get("id")
@@ -247,7 +232,7 @@ class CompatRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = serverless.cancel(job_id, endpoint_id=endpoint_id)
+            result = worker_cancel(job_id)
             self._send_json(result)
         except Exception as exc:
             self._send_error(str(exc), 500)
@@ -266,11 +251,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=(
-            "Run a RunPod-compatible compatibility server for ComfyGen. "
-            "It exposes the same routes as the RunPod API and delegates to "
-            "`comfy_gen.serverless` for submit/status/cancel."
-        )
+        description="Run a RunPod-compatible compatibility server for ComfyGen backed by the local worker.py."
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Listen port (default: 8000)")
