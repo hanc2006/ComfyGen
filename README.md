@@ -1,6 +1,34 @@
 # comfy-gen
 
-**An agentic CLI for running ComfyUI workflows on RunPod serverless.** Designed to be used by AI coding agents (Claude Code, Cursor, Codex, Windsurf, Gemini CLI) as much as by humans. All output is structured JSON. No interactive prompts. Every command has verbose `--help` so agents can discover capabilities without documentation.
+**An agentic CLI for running ComfyUI workflows on RunPod serverless.** Designed to be used by AI coding agents (Claude Code, Cursor, Codex, Windsurf, Gemini CLI) as much as by humans. All output is structured JSON to stdout, with human-readable progress logs on stderr.
+
+This fork also includes a local dedicated-GPU compatibility mode using `server.py` and `worker.py`.
+
+## Local dedicated-GPU compatibility mode
+
+If you want to avoid RunPod serverless and run on your own GPU machine, you can start a local compatibility server that exposes the same RunPod-style API surface:
+
+```bash
+python server.py --host 0.0.0.0 --port 8000
+```
+
+This exposes endpoints such as:
+
+```bash
+POST /run
+GET /status/<job_id>
+POST /cancel/<job_id>
+GET /health
+```
+
+The worker implementation is in `worker.py`. It provides a local job queue and compatibility status lifecycle for a dedicated GPU host. By default it runs in a safe simulation mode unless you set the worker command environment variable:
+
+```bash
+export COMFY_GEN_WORKER_COMMAND='python /path/to/run_local_workflow.py --workflow {workflow_path}'
+python worker.py --host 0.0.0.0 --port 8001
+```
+
+This allows a dedicated GPU pod or local server to provide the same interface as the RunPod backend while still running a local workflow executor underneath.
 
 ## Table of Contents
 
@@ -23,7 +51,7 @@
 
 ## Use with Your Favorite AI Agent
 
-ComfyGen ships with an **agent skill file** at `SKILL.md` in the repo root. Drop it into your agent's skill/tool directory and it can submit workflows, download models, check job status, and manage your RunPod infrastructure — all through natural language.
+ComfyGen ships with an **agent skill file** at `SKILL.md` in the repo root. Drop it into your agent's skill/tool directory and it can submit workflows, download models, check job status, and manage your generation jobs.
 
 ```
 You: "Submit this workflow with seed 42 and download the output"
@@ -81,7 +109,7 @@ pip install boto3
 
 After installation, `comfy-gen` is available system-wide as a CLI command.
 
-> **Windows users:** Make sure "Add Python to PATH" was checked during Python installation, or `comfy-gen` won't be found. If you missed it, add Python's `Scripts` directory to your PATH manually (e.g. `C:\Users\<you>\AppData\Local\Programs\Python\Python3xx\Scripts`).
+> **Windows users:** Make sure "Add Python to PATH" was checked during Python installation, or `comfy-gen` won't be found. If you missed it, add Python's `Scripts` directory to your PATH manually.
 
 ## Quick Start
 
@@ -240,7 +268,7 @@ There are two ways to populate your RunPod network volume with models:
 
 ### Option 1: `comfy-gen download` (individual models)
 
-Download specific models from CivitAI or HuggingFace directly to your volume. Best for adding individual LoRAs, checkpoints, or other files on demand. See the [download command](#comfy-gen-download-civitaiurl-target) above.
+Download specific models from CivitAI or HuggingFace directly to your volume. Best for adding individual LoRAs, checkpoints, or other files on demand. See the [download command](#comfy-gen-download-civitaiurl-target).
 
 ### Option 2: Pre-populated RunPod Templates (full model sets)
 
@@ -293,7 +321,7 @@ You can also put these in a `.env` file in your project directory.
 
 ## Storage
 
-ComfyGen requires **S3-compatible storage** for transferring input files (images, videos) to workers and receiving output files. The setup wizard (`comfy-gen init`) configures storage and verifies it works before creating your endpoint.
+ComfyGen requires **S3-compatible storage** for transferring input files (images, videos) to workers and receiving output files. The setup wizard (`comfy-gen init`) configures storage and verifies it automatically.
 
 | Service | Config |
 |---------|--------|
