@@ -2,11 +2,108 @@
 
 **An agentic CLI for running ComfyUI workflows on RunPod serverless.** Designed to be used by AI coding agents (Claude Code, Cursor, Codex, Windsurf, Gemini CLI) as much as by humans. All output is structured JSON to stdout, with human-readable progress logs on stderr.
 
-This fork also includes a local dedicated-GPU compatibility mode using `server.py` and `worker.py`.
+This fork also includes a dedicated GPU compatibility mode for a RunPod pod that keeps a single ComfyUI instance alive and exposes a RunPod-style HTTP API through `server.py`.
+
+## RunPod pod startup (final working pattern)
+
+Use this startup flow in the pod. The important idea is:
+- start ComfyUI once on port 8188
+- keep it alive for the lifetime of the pod
+- start `server.py` on port 8000 to expose a RunPod-compatible API
+- expose only port 8000 via RunPod public port mapping
+- the app uses the official ComfyUI Python SDK to interact with the local ComfyUI instance
+
+### `runpod-start.sh`
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+cd /workspace || cd /workspaces || cd ~
+if [ -d /workspace/ComfyGen ]; then
+  cd /workspace/ComfyGen
+elif [ -d /workspaces/ComfyGen ]; then
+  cd /workspaces/ComfyGen
+elif [ -d "$HOME/ComfyGen" ]; then
+  cd "$HOME/ComfyGen"
+else
+  echo "ComfyGen repo not found. Clone it first."
+  exit 1
+fi
+
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install comfyui || true
+
+# Start ComfyUI once and keep it alive.
+if [ -d /workspace/ComfyUI ]; then
+  cd /workspace/ComfyUI
+  nohup python main.py --listen 0.0.0.0 --port 8188 >/tmp/comfyui.log 2>&1 &
+  echo "Started ComfyUI on 8188"
+else
+  echo "WARNING: /workspace/ComfyUI not found. ComfyUI must be started manually."
+fi
+
+sleep 15
+
+cd /workspace/ComfyGen
+nohup python server.py --host 0.0.0.0 --port 8000 >/tmp/comfygen-server.log 2>&1 &
+nohup python worker.py --host 0.0.0.0 --port 8001 >/tmp/comfygen-worker.log 2>&1 &
+
+sleep 3
+
+echo "Health checks:"
+curl -fsS http://127.0.0.1:8188/system_stats || true
+echo
+curl -fsS http://127.0.0.1:8000/health || true
+echo
+curl -fsS http://127.0.0.1:8001/health || true
+```
+
+### Run it
+
+```bash
+chmod +x runpod-start.sh
+./runpod-start.sh
+```
+
+### Port mapping
+
+Expose only the app server port via RunPod:
+- internal port: `8000`
+- public URL pattern:
+  `https://<pod_id>-8000.proxy.runpod.net`
+
+Do not expose the ComfyUI internal port 8188 publicly unless you explicitly want direct access to the ComfyUI UI.
+
+### Example API calls
+
+```bash
+curl -X POST http://127.0.0.1:8000/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input": {
+      "workflow": {
+        "1": {
+          "class_type": "CheckpointLoaderSimple",
+          "inputs": {"ckpt_name": "example.safetensors"}
+        }
+      },
+      "timeout": 120
+    }
+  }'
+```
+
+Then check:
+
+```bash
+curl http://127.0.0.1:8000/status/<job_id>
+curl -X POST http://127.0.0.1:8000/cancel/<job_id>
+```
 
 ## Local dedicated-GPU compatibility mode
 
-If you want to avoid RunPod serverless and run on your own GPU machine, you can start a local compatibility server that exposes the same RunPod-style API surface:
+If you want to run without RunPod serverless on your own GPU machine, start the local compatibility server:
 
 ```bash
 python server.py --host 0.0.0.0 --port 8000
@@ -21,14 +118,7 @@ POST /cancel/<job_id>
 GET /health
 ```
 
-The worker implementation is in `worker.py`. It provides a local job queue and compatibility status lifecycle for a dedicated GPU host. By default it runs in a safe simulation mode unless you set the worker command environment variable:
-
-```bash
-export COMFY_GEN_WORKER_COMMAND='python /path/to/run_local_workflow.py --workflow {workflow_path}'
-python worker.py --host 0.0.0.0 --port 8001
-```
-
-This allows a dedicated GPU pod or local server to provide the same interface as the RunPod backend while still running a local workflow executor underneath.
+The worker implementation is in `worker.py`. It keeps ComfyUI alive once and uses the official ComfyUI Python SDK to queue and poll prompt execution through the local server at `http://127.0.0.1:8188`.
 
 ## Table of Contents
 
@@ -76,7 +166,7 @@ Workers spin up on demand, execute the workflow, and shut down. You pay only for
 ## Development & Testing
 
 ```bash
-pip install -e '.[dev]'    # installs pytest + pytest-mock
+pip install -e '.[dev]'
 python3 -m pytest tests/
 ```
 
