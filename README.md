@@ -4,121 +4,76 @@
 
 This fork also includes a dedicated GPU compatibility mode for a RunPod pod that keeps a single ComfyUI instance alive and exposes a RunPod-style HTTP API through `server.py`.
 
-## RunPod pod startup (final working pattern)
+## Pod mode (dedicated GPU pod instead of serverless)
 
-Use this startup flow in the pod. The important idea is:
-- start ComfyUI once on port 8188
-- keep it alive for the lifetime of the pod
-- start `server.py` on port 8000 to expose a RunPod-compatible API
-- expose only port 8000 via RunPod public port mapping
-- the app uses the official ComfyUI Python SDK to interact with the local ComfyUI instance
+Instead of RunPod serverless, you can run a regular RunPod GPU pod that keeps
+one ComfyUI instance alive and exposes the same job API through `server.py`.
+The `comfy-gen` CLI talks to it unchanged once `api_base_url` points at the pod.
 
-### `runpod-start.sh`
+```
+comfy-gen submit ──HTTPS──> server.py :8000 (on the pod) ──HTTP──> ComfyUI :8188
+                                │                                      │
+                                └── worker.py: queue, poll, cancel ────┘
+                                    outputs uploaded to S3 → pre-signed URL
+```
+
+`worker.py` uses ComfyUI's HTTP API (`/prompt`, `/queue`, `/history`, `/view`,
+`/upload/image`, `/interrupt`). No extra SDK is needed.
+
+### On the pod: `runpod-start.sh`
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 
-cd /workspace || cd /workspaces || cd ~
-if [ -d /workspace/ComfyGen ]; then
-  cd /workspace/ComfyGen
-elif [ -d /workspaces/ComfyGen ]; then
-  cd /workspaces/ComfyGen
-elif [ -d "$HOME/ComfyGen" ]; then
-  cd "$HOME/ComfyGen"
-else
-  echo "ComfyGen repo not found. Clone it first."
-  exit 1
-fi
-
-python -m pip install --upgrade pip
-python -m pip install -e .
-python -m pip install comfyui || true
-
-# Start ComfyUI once and keep it alive.
-if [ -d /workspace/ComfyUI ]; then
-  cd /workspace/ComfyUI
-  nohup python main.py --listen 0.0.0.0 --port 8188 >/tmp/comfyui.log 2>&1 &
-  echo "Started ComfyUI on 8188"
-else
-  echo "WARNING: /workspace/ComfyUI not found. ComfyUI must be started manually."
-fi
-
-sleep 15
+# Required: shared API token (clients send it as "Authorization: Bearer <token>")
+: "${COMFYGEN_API_TOKEN:?set COMFYGEN_API_TOKEN in the pod environment}"
+# Required for outputs: S3-compatible storage (same variables as the CLI)
+: "${AWS_ACCESS_KEY_ID:?}" "${AWS_SECRET_ACCESS_KEY:?}" "${S3_BUCKET:?}"
+# Optional: S3_ENDPOINT_URL (R2/B2/MinIO), S3_REGION, COMFYUI_BASE_URL
 
 cd /workspace/ComfyGen
+python -m pip install -e . boto3
+
+# Start ComfyUI once and keep it alive
+(cd /workspace/ComfyUI && nohup python main.py --listen 127.0.0.1 --port 8188 >/tmp/comfyui.log 2>&1 &)
+
+# Wait until ComfyUI answers instead of sleeping a fixed time
+until curl -fsS http://127.0.0.1:8188/system_stats >/dev/null; do sleep 2; done
+
 nohup python server.py --host 0.0.0.0 --port 8000 >/tmp/comfygen-server.log 2>&1 &
-nohup python worker.py --host 0.0.0.0 --port 8001 >/tmp/comfygen-worker.log 2>&1 &
-
-sleep 3
-
-echo "Health checks:"
-curl -fsS http://127.0.0.1:8188/system_stats || true
-echo
-curl -fsS http://127.0.0.1:8000/health || true
-echo
-curl -fsS http://127.0.0.1:8001/health || true
+sleep 1 && curl -fsS http://127.0.0.1:8000/health
 ```
 
-### Run it
+Expose only port `8000` through RunPod (`https://<pod_id>-8000.proxy.runpod.net`).
+ComfyUI stays bound to localhost.
+
+### On your machine: point the CLI at the pod
 
 ```bash
-chmod +x runpod-start.sh
-./runpod-start.sh
+comfy-gen config --set api_base_url=https://<pod_id>-8000.proxy.runpod.net
+comfy-gen config --set runpod_api_key=<same value as COMFYGEN_API_TOKEN>
+comfy-gen submit workflow.json --override 7.seed=42
 ```
 
-### Port mapping
+`submit`, `status` and `cancel` work in pod mode. Local `--input` files are still
+uploaded to S3 first, and the pod downloads them into ComfyUI's input folder.
+The volume/model commands (`download`, `list`, `hash`, `object_info`, `info`,
+`delete`, `version`) still target RunPod serverless only.
 
-Expose only the app server port via RunPod:
-- internal port: `8000`
-- public URL pattern:
-  `https://<pod_id>-8000.proxy.runpod.net`
+### Server API
 
-Do not expose the ComfyUI internal port 8188 publicly unless you explicitly want direct access to the ComfyUI UI.
+| Route | Description |
+|-------|-------------|
+| `POST /run` | `{"input": {"workflow": {...}, "overrides": {...}, "file_inputs": {...}, "timeout": 1200}}` → `{"id", "status"}` |
+| `POST /runsync` | Same body. Waits up to 90s and returns the job envelope |
+| `GET /status/<id>` | `{"id", "status", "output", "error", "delayTime", "executionTime"}` |
+| `POST /cancel/<id>` | Removes the prompt from ComfyUI's queue, or interrupts it if it is running |
+| `GET /health` | No auth. Returns 503 if ComfyUI is unreachable |
 
-### Example API calls
-
-```bash
-curl -X POST http://127.0.0.1:8000/run \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "input": {
-      "workflow": {
-        "1": {
-          "class_type": "CheckpointLoaderSimple",
-          "inputs": {"ckpt_name": "example.safetensors"}
-        }
-      },
-      "timeout": 120
-    }
-  }'
-```
-
-Then check:
-
-```bash
-curl http://127.0.0.1:8000/status/<job_id>
-curl -X POST http://127.0.0.1:8000/cancel/<job_id>
-```
-
-## Local dedicated-GPU compatibility mode
-
-If you want to run without RunPod serverless on your own GPU machine, start the local compatibility server:
-
-```bash
-python server.py --host 0.0.0.0 --port 8000
-```
-
-This exposes endpoints such as:
-
-```bash
-POST /run
-GET /status/<job_id>
-POST /cancel/<job_id>
-GET /health
-```
-
-The worker implementation is in `worker.py`. It keeps ComfyUI alive once and uses the official ComfyUI Python SDK to queue and poll prompt execution through the local server at `http://127.0.0.1:8188`.
+Every route also accepts the RunPod prefix `/v2/<endpoint_id>/...` (the ID is ignored).
+Jobs are held in memory: restarting `server.py` forgets them, and finished jobs are
+dropped after `COMFY_GEN_JOB_TTL` seconds (default 3600).
 
 ## Table of Contents
 

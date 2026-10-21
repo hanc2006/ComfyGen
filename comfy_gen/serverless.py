@@ -25,13 +25,38 @@ def _runpod_api_key() -> str:
     return key
 
 
+DEFAULT_API_BASE_URL = "https://api.runpod.ai"
+
+
+def _api_base_url() -> str:
+    """Get the RunPod-style API base URL (RunPod cloud or a pod's server.py)."""
+    from comfy_gen import config
+    cfg = config.load()
+    return (cfg.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def _is_pod_mode() -> bool:
+    return _api_base_url() != DEFAULT_API_BASE_URL
+
+
+def _endpoint_url(endpoint_id: str) -> str:
+    """Return the base URL for endpoint routes: <base>/v2/<endpoint_id>."""
+    return f"{_api_base_url()}/v2/{endpoint_id}"
+
+
 def _endpoint_id(override: str | None = None) -> str:
-    """Get RunPod endpoint ID from override, config, or env."""
+    """Get RunPod endpoint ID from override, config, or env.
+
+    In pod mode (custom api_base_url) the endpoint ID is optional, since
+    server.py ignores it.
+    """
     if override:
         return override
     from comfy_gen import config
     cfg = config.load()
     eid = cfg.get("endpoint_id", "") or os.environ.get("RUNPOD_ENDPOINT_ID", "")
+    if not eid and _is_pod_mode():
+        return "pod"
     if not eid:
         raise ValueError(
             "No RunPod endpoint ID configured. Set via:\n"
@@ -248,16 +273,16 @@ def submit(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as logf:
         logf.write(f"\n{'='*80}\n")
-        logf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] POST https://api.runpod.ai/v2/{endpoint_id}/run\n")
+        logf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] POST {_endpoint_url(endpoint_id)}/run\n")
         logf.write(json.dumps(payload, indent=2))
         logf.write("\n")
     output.log(f"Full request logged to {log_path.resolve()}")
 
     # Submit to RunPod
-    output.log("Submitting to RunPod serverless endpoint...")
+    output.log("Submitting to pod server..." if _is_pod_mode() else "Submitting to RunPod serverless endpoint...")
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        f"https://api.runpod.ai/v2/{endpoint_id}/run",
+        f"{_endpoint_url(endpoint_id)}/run",
         data=data,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -278,7 +303,7 @@ def submit(
     output.log(f"Job submitted: {job_id}")
 
     # Poll for completion
-    status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+    status_url = f"{_endpoint_url(endpoint_id)}/status/{job_id}"
     elapsed = 0
     while elapsed < timeout:
         time.sleep(poll_interval)
@@ -358,7 +383,7 @@ def status(job_id: str, endpoint_id: str | None = None) -> dict[str, Any]:
     endpoint_id = _endpoint_id(endpoint_id)
 
     req = urllib.request.Request(
-        f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}",
+        f"{_endpoint_url(endpoint_id)}/status/{job_id}",
         headers={"Authorization": f"Bearer {api_key}"},
     )
 
@@ -392,7 +417,7 @@ def cancel(job_id: str, endpoint_id: str | None = None) -> dict[str, Any]:
     endpoint_id = _endpoint_id(endpoint_id)
 
     req = urllib.request.Request(
-        f"https://api.runpod.ai/v2/{endpoint_id}/cancel/{job_id}",
+        f"{_endpoint_url(endpoint_id)}/cancel/{job_id}",
         headers={"Authorization": f"Bearer {api_key}"},
         method="POST",
     )

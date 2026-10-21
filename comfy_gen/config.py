@@ -12,6 +12,9 @@ INIT_FILE = CONFIG_DIR / "init.json"
 DEFAULTS: dict[str, Any] = {
     "runpod_api_key": "",
     "endpoint_id": "",
+    # Base URL of the RunPod-style API. Point at a pod running server.py
+    # (e.g. https://<pod_id>-8000.proxy.runpod.net) to use pod mode.
+    "api_base_url": "https://api.runpod.ai",
     # Storage (S3-compatible)
     "aws_access_key_id": "",
     "aws_secret_access_key": "",
@@ -27,6 +30,7 @@ DEFAULTS: dict[str, Any] = {
 ENV_MAP = {
     "RUNPOD_API_KEY": "runpod_api_key",
     "RUNPOD_ENDPOINT_ID": "endpoint_id",
+    "COMFYGEN_API_BASE_URL": "api_base_url",
     "AWS_ACCESS_KEY_ID": "aws_access_key_id",
     "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
     "S3_REGION": "s3_region",
