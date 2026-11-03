@@ -103,28 +103,100 @@ until curl -fsS "${COMFYUI_BASE_URL}/system_stats" >/dev/null 2>&1; do
 done
 echo " ready"
 
-# Restart the pod server if one started by this script is still running.
+# --- Make sure the port is free and ends up served by the process we start ---
+# `ss`/`lsof` are often missing on pod images, so read /proc directly.
+# Prints "pid<TAB>cwd<TAB>cmdline" for each process listening on TCP port $1.
+port_owners() {
+  "$PYTHON" - "$1" <<'PY'
+import glob, os, sys
+port = int(sys.argv[1])
+inodes = set()
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        lines = open(table).read().splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        f = line.split()
+        if len(f) > 9 and f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == port:
+            inodes.add(f[9])
+for fd in glob.glob("/proc/[0-9]*/fd/*"):
+    try:
+        link = os.readlink(fd)
+    except OSError:
+        continue
+    if link.startswith("socket:[") and link[8:-1] in inodes:
+        pid = fd.split("/")[2]
+        inodes.discard(link[8:-1])
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cwd, cmd = "?", "?"
+        print(f"{pid}\t{cwd}\t{cmd}")
+PY
+}
+
+stop_pid() {  # stop_pid <pid>: TERM, then KILL after 10s
+  kill "$1" 2>/dev/null || return 0
+  for _ in $(seq 1 10); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -9 "$1" 2>/dev/null || true
+}
+
+# 1. The server this script started last time.
 PID_FILE="${LOG_DIR}/comfygen-server.pid"
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "==> Stopping previous server (pid $(cat "$PID_FILE"))"
-  kill "$(cat "$PID_FILE")" || true
-  sleep 1
+  stop_pid "$(cat "$PID_FILE")"
+fi
+rm -f "$PID_FILE"
+
+# 2. Anything else still holding the port: an older ComfyGen server (started by
+#    hand, by an older script, or with another LOG_DIR) is replaced; any other
+#    program is left alone and we refuse to start.
+while IFS=$'\t' read -r opid ocwd ocmd; do
+  [ -n "$opid" ] || continue
+  if [[ "$ocmd" == *server.py* || "$ocwd" == "$REPO_DIR"* ]]; then
+    echo "==> Stopping a ComfyGen server not started by this script (pid ${opid}: ${ocmd})"
+    stop_pid "$opid"
+  else
+    echo "ERROR: port ${SERVER_PORT} is used by another program (pid ${opid}: ${ocmd})." >&2
+    echo "       Stop it or choose another port with SERVER_PORT=..." >&2
+    exit 1
+  fi
+done < <(port_owners "$SERVER_PORT")
+if [ -n "$(port_owners "$SERVER_PORT")" ]; then
+  echo "ERROR: port ${SERVER_PORT} is still in use:" >&2
+  port_owners "$SERVER_PORT" >&2
+  exit 1
 fi
 
 echo "==> Starting ComfyGen server on port ${SERVER_PORT} (log: ${LOG_DIR}/comfygen-server.log)"
 cd "$REPO_DIR"
 nohup "$PYTHON" server.py --host 0.0.0.0 --port "$SERVER_PORT" >"${LOG_DIR}/comfygen-server.log" 2>&1 &
-echo $! >"$PID_FILE"
+pid=$!
+echo "$pid" >"$PID_FILE"
 
+# Ready only when OUR process owns the port and answers /health.
 for _ in $(seq 1 15); do
-  if curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
-    echo "==> Ready: http://127.0.0.1:${SERVER_PORT}/health"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "ERROR: the server exited during startup. Log:" >&2
+    tail -n 30 "${LOG_DIR}/comfygen-server.log" >&2 || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
+  if [ "$(port_owners "$SERVER_PORT" | cut -f1)" = "$pid" ] \
+     && curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
+    echo "==> Ready (pid ${pid}): http://127.0.0.1:${SERVER_PORT}/health"
     [ -n "${RUNPOD_POD_ID:-}" ] && echo "    Public URL: https://${RUNPOD_POD_ID}-${SERVER_PORT}.proxy.runpod.net"
     exit 0
   fi
   sleep 1
 done
 
-echo "ERROR: server did not respond on port ${SERVER_PORT}. Log:" >&2
+echo "ERROR: server (pid ${pid}) did not answer on port ${SERVER_PORT}. Log:" >&2
 tail -n 30 "${LOG_DIR}/comfygen-server.log" >&2 || true
 exit 1
