@@ -11,7 +11,7 @@ one ComfyUI instance alive and exposes the same job API through `server.py`.
 The `comfy-gen` CLI talks to it unchanged once `api_base_url` points at the pod.
 
 ```
-comfy-gen submit ──HTTPS──> server.py :8000 (on the pod) ──HTTP──> ComfyUI :8188
+comfy-gen submit ──HTTPS──> server.py :8787 (on the pod) ──HTTP──> ComfyUI :8188
                                 │                                      │
                                 └── worker.py: queue, poll, cancel ────┘
                                     outputs served at /outputs/<id>/<index>
@@ -25,34 +25,42 @@ needs S3 to return output URLs.
 `worker.py` uses ComfyUI's HTTP API (`/prompt`, `/queue`, `/history`, `/view`,
 `/upload/image`, `/interrupt`). No extra SDK is needed.
 
-### On the pod: `runpod-start.sh`
+### On the pod: `start-comfygen.sh`
 
-Clone the repo on the pod, set the environment, and run the script that ships in the repo root:
+Clone the repo on the pod and run the script that ships in the repo root. ComfyUI must
+already be running (the pod template starts it); the script does not start it.
 
 ```bash
 git clone https://github.com/hanc2006/ComfyGen.git /workspace/ComfyGen
 cd /workspace/ComfyGen
-
-export COMFYGEN_API_TOKEN=<long random secret>   # clients send it as Bearer token
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... S3_BUCKET=...
-# optional: S3_ENDPOINT_URL (R2/B2/MinIO), S3_REGION, COMFYUI_DIR (default /workspace/ComfyUI)
-
-./runpod-start.sh
+./start-comfygen.sh
 ```
 
-The script installs ComfyGen and boto3, then starts ComfyUI on `127.0.0.1:8188`. If a
-ComfyUI is already running there (for example, started by the pod template), it uses that
-one. It waits until ComfyUI answers, then starts `server.py` on port 8000 and checks
-`/health`. Logs go to `/tmp/comfyui.log` and `/tmp/comfygen-server.log`. If you run the
-script again, it restarts the server.
+All settings are optional environment variables:
 
-Expose only port `8000` through RunPod (`https://<pod_id>-8000.proxy.runpod.net`).
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `COMFYGEN_API_TOKEN` | generated and printed | Bearer token clients must send |
+| `SERVER_PORT` | `8787` | Port of `server.py`; expose it through RunPod |
+| `COMFYUI_PORT` | `8188` | Port of the running ComfyUI |
+| `COMFYUI_WAIT` | `300` | Seconds to wait for ComfyUI to answer |
+| `COMFYUI_MODELS_DIR` | `/workspace/models` | ComfyUI models folder that preset installs write to |
+| `PYTHON` | `/usr/local/bin/python` | Interpreter |
+| `PYTHON_LIBS` | `/workspace/.python` | Persistent package folder (used as `PYTHONUSERBASE`) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET` | unset | Optional S3 output storage (`S3_ENDPOINT_URL`, `S3_REGION` for R2/B2/MinIO) |
+
+The script installs ComfyGen and boto3 into `PYTHON_LIBS`, waits until ComfyUI answers,
+then starts `server.py` and checks `/health`. The log goes to `/tmp/comfygen-server.log`.
+Running the script again restarts the server. A generated token changes on every run, so
+set `COMFYGEN_API_TOKEN` in the pod environment to keep it stable.
+
+Expose only `SERVER_PORT` through RunPod (`https://<pod_id>-8787.proxy.runpod.net`).
 ComfyUI stays bound to localhost.
 
 ### On your machine: point the CLI at the pod
 
 ```bash
-comfy-gen config --set api_base_url=https://<pod_id>-8000.proxy.runpod.net
+comfy-gen config --set api_base_url=https://<pod_id>-8787.proxy.runpod.net
 comfy-gen config --set runpod_api_key=<same value as COMFYGEN_API_TOKEN>
 comfy-gen submit workflow.json --override 7.seed=42
 ```
@@ -84,7 +92,8 @@ The volume/model commands (`download`, `list`, `hash`, `object_info`, `info`,
 
 Every route also accepts the RunPod prefix `/v2/<endpoint_id>/...` (the ID is ignored).
 `COMFYGEN_MAX_UPLOAD_MB` caps `/upload` bodies (default 1024).
-Model routes write to `COMFYUI_MODELS_DIR`, or by default the first existing folder of
+Model routes write to `COMFYUI_MODELS_DIR` (`start-comfygen.sh` defaults it to
+`/workspace/models`); when it is unset, the first existing folder of `/workspace/models`,
 `/workspace/ComfyUI/models` and `/ComfyUI/models`. The HF token is only sent to
 `huggingface.co` and the CivitAI token only to `civitai.com`; neither follows a redirect
 to another host.

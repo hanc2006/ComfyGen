@@ -10,7 +10,8 @@ background thread; only one job runs at a time.
 
 Environment:
   COMFYUI_MODELS_DIR   ComfyUI models folder. Default: the first that exists
-                       of /workspace/ComfyUI/models and /ComfyUI/models.
+                       of /workspace/models, /workspace/ComfyUI/models and
+                       /ComfyUI/models (start-comfygen.sh sets /workspace/models).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODELS_DIRS = ("/workspace/ComfyUI/models", "/ComfyUI/models")
+DEFAULT_MODELS_DIRS = ("/workspace/models", "/workspace/ComfyUI/models", "/ComfyUI/models")
 CHUNK_BYTES = 8 * 1024 * 1024
 DOWNLOAD_ATTEMPTS = 3
 JOB_TTL_SECONDS = 3600

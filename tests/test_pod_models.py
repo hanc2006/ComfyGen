@@ -287,3 +287,17 @@ def test_server_models_dir_missing(pod_server, monkeypatch, tmp_path):
     monkeypatch.setenv("COMFYUI_MODELS_DIR", str(tmp_path / "nope"))
     assert _call(f"{pod_server}/models/disk")[0] == 503
     assert _call(f"{pod_server}/models/download", "POST", {"models": [{"url": "http://x/a", "dest": "loras/a"}]})[0] == 503
+
+
+def test_models_dir_default_prefers_first_existing(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMFYUI_MODELS_DIR", raising=False)
+    first, second = tmp_path / "workspace_models", tmp_path / "comfy_models"
+    second.mkdir()
+    monkeypatch.setattr(pod_models, "DEFAULT_MODELS_DIRS", (str(first), str(second)))
+    assert pod_models.models_dir() == second.resolve()
+    first.mkdir()
+    assert pod_models.models_dir() == first.resolve()
+
+
+def test_default_models_dirs_start_with_workspace_models():
+    assert pod_models.DEFAULT_MODELS_DIRS[0] == "/workspace/models"
