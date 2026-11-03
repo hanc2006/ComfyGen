@@ -18,7 +18,8 @@
 #   COMFYUI_WAIT       Seconds to wait for ComfyUI to answer (default: 300)
 #   COMFYUI_MODELS_DIR ComfyUI models folder used by /models/* (preset installs)
 #                      (default: /workspace/models)
-#   SERVER_PORT        Pod server port to expose via RunPod (default: 8787)
+#   SERVER_PORT        Pod server port (default: 9010). BlockFlow on the same pod uses
+#                      http://127.0.0.1:9010; expose it in RunPod only for outside clients.
 #   PYTHON             Interpreter (default: /usr/local/bin/python)
 #   PYTHON_LIBS        Persistent package folder on the volume (default: /workspace/.python).
 #                      Used as PYTHONUSERBASE: packages go to its lib/pythonX.Y/site-packages,
@@ -29,7 +30,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 COMFYUI_WAIT="${COMFYUI_WAIT:-300}"
-SERVER_PORT="${SERVER_PORT:-8787}"
+SERVER_PORT="${SERVER_PORT:-9010}"
 PYTHON="${PYTHON:-/usr/local/bin/python}"
 PYTHON_LIBS="${PYTHON_LIBS:-/workspace/.python}"
 LOG_DIR="${LOG_DIR:-/tmp}"

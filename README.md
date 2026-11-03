@@ -11,7 +11,7 @@ one ComfyUI instance alive and exposes the same job API through `server.py`.
 The `comfy-gen` CLI talks to it unchanged once `api_base_url` points at the pod.
 
 ```
-comfy-gen submit ──HTTPS──> server.py :8787 (on the pod) ──HTTP──> ComfyUI :8188
+comfy-gen submit ──HTTPS──> server.py :9010 (on the pod) ──HTTP──> ComfyUI :8188
                                 │                                      │
                                 └── worker.py: queue, poll, cancel ────┘
                                     outputs served at /outputs/<id>/<index>
@@ -41,7 +41,7 @@ All settings are optional environment variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `COMFYGEN_API_TOKEN` | generated and printed | Bearer token clients must send |
-| `SERVER_PORT` | `8787` | Port of `server.py`; expose it through RunPod |
+| `SERVER_PORT` | `9010` | Port of `server.py`. BlockFlow on the same pod uses `http://127.0.0.1:9010`; expose it in RunPod only for clients outside the pod |
 | `COMFYUI_PORT` | `8188` | Port of the running ComfyUI |
 | `COMFYUI_WAIT` | `300` | Seconds to wait for ComfyUI to answer |
 | `COMFYUI_MODELS_DIR` | `/workspace/models` | ComfyUI models folder that preset installs write to |
@@ -54,13 +54,13 @@ then starts `server.py` and checks `/health`. The log goes to `/tmp/comfygen-ser
 Running the script again restarts the server. A generated token changes on every run, so
 set `COMFYGEN_API_TOKEN` in the pod environment to keep it stable.
 
-Expose only `SERVER_PORT` through RunPod (`https://<pod_id>-8787.proxy.runpod.net`).
+To reach it from outside the pod, expose `SERVER_PORT` through RunPod (`https://<pod_id>-9010.proxy.runpod.net`).
 ComfyUI stays bound to localhost.
 
 ### On your machine: point the CLI at the pod
 
 ```bash
-comfy-gen config --set api_base_url=https://<pod_id>-8787.proxy.runpod.net
+comfy-gen config --set api_base_url=https://<pod_id>-9010.proxy.runpod.net
 comfy-gen config --set runpod_api_key=<same value as COMFYGEN_API_TOKEN>
 comfy-gen submit workflow.json --override 7.seed=42
 ```

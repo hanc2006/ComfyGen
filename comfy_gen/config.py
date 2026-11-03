@@ -13,7 +13,7 @@ DEFAULTS: dict[str, Any] = {
     "runpod_api_key": "",
     "endpoint_id": "",
     # Base URL of the RunPod-style API. Point at a pod running server.py
-    # (e.g. https://<pod_id>-8000.proxy.runpod.net) to use pod mode.
+    # (e.g. https://<pod_id>-9010.proxy.runpod.net) to use pod mode.
     "api_base_url": "https://api.runpod.ai",
     # Storage (S3-compatible)
     "aws_access_key_id": "",

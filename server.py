@@ -331,7 +331,7 @@ def run_server(host: str, port: int, api_token: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="RunPod-compatible API server for a dedicated ComfyUI pod.")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Listen port (default: 8000)")
+    parser.add_argument("--port", type=int, default=9010, help="Listen port (default: 9010)")
     parser.add_argument(
         "--insecure", action="store_true",
         help="Allow running without COMFYGEN_API_TOKEN (anyone with the URL can use the GPU)",
