@@ -18,6 +18,14 @@ BlockFlow "persistent ComfyGen server" routes:
   GET  /outputs/<job_id>/<index>  -> the output file's bytes (index from output.files[].index)
   GET  /inventory           -> {"ok", "samplers", "schedulers", "models": {"loras": [...], ...}}
 
+Model files (see pod_models.py; paths are relative to the ComfyUI models folder):
+  POST /models/download     {"models": [{"url", "dest", "sha256"?, "size_gb"?}], "hf_token"?, "civitai_token"?}
+                            -> 202 download job status; 409 if one is running, 507 if the disk is too small
+  GET  /models/download/<id>          -> {"id", "status", "files": [...], "bytes_done", "bytes_total", ...}
+  POST /models/download/<id>/cancel
+  POST /models/delete       {"paths": ["loras/x.safetensors", ...]} -> {"ok", "results": [...]}
+  GET  /models/disk         -> {"models_dir", "total_bytes", "free_bytes"}
+
 Every route except /health requires `Authorization: Bearer $COMFYGEN_API_TOKEN`.
 
 Environment:
@@ -35,6 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
+import pod_models
 import worker
 
 MAX_BODY_BYTES = 50 * 1024 * 1024
@@ -188,6 +197,19 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["inventory"]:
                 self._send_json(worker.inventory())
                 return
+            if parts == ["models", "disk"]:
+                self._send_json(pod_models.disk_usage())
+                return
+            if len(parts) == 3 and parts[:2] == ["models", "download"]:
+                status = pod_models.download_status(parts[2])
+                if status is None:
+                    self._send_error(f"Unknown download: {parts[2]}", 404)
+                else:
+                    self._send_json(status)
+                return
+        except pod_models.ModelsDirError as exc:
+            self._send_error(str(exc), 503)
+            return
         except Exception as exc:
             self.log_error("unhandled error on %s: %r", self.path, exc)
             self._send_error(f"Internal error: {exc}", 500)
@@ -242,6 +264,36 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2 and parts[0] == "upload":
                 self._handle_upload(parts[1])
                 return
+            if parts == ["models", "download"]:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise ValueError("Request body must be a JSON object")
+                self._send_json(pod_models.start_download(
+                    body.get("models"),
+                    hf_token=str(body.get("hf_token") or ""),
+                    civitai_token=str(body.get("civitai_token") or ""),
+                ), 202)
+                return
+            if len(parts) == 4 and parts[:2] == ["models", "download"] and parts[3] == "cancel":
+                status = pod_models.cancel_download(parts[2])
+                if status is None:
+                    self._send_error(f"Unknown download: {parts[2]}", 404)
+                else:
+                    self._send_json(status)
+                return
+            if parts == ["models", "delete"]:
+                body = self._read_json()
+                self._send_json(pod_models.delete_models(body.get("paths") if isinstance(body, dict) else None))
+                return
+        except pod_models.DownloadBusy as exc:
+            self._send_error(str(exc), 409)
+            return
+        except pod_models.InsufficientDisk as exc:
+            self._send_error(str(exc), 507)
+            return
+        except pod_models.ModelsDirError as exc:
+            self._send_error(str(exc), 503)
+            return
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_error(str(exc), 400)
             return
