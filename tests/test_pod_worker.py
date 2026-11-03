@@ -107,6 +107,17 @@ def fake_comfy(monkeypatch):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/object_info/KSampler":
+                return self._json({"KSampler": {"input": {"required": {
+                    "sampler_name": [["euler", "dpmpp_2m"], {}],
+                    "scheduler": ["COMBO", {"options": ["normal", "karras"]}],
+                }}}})
+            if self.path == "/object_info/LoraLoader":
+                return self._json({"LoraLoader": {"input": {"required": {"lora_name": [["old.safetensors"], {}]}}}})
+            if self.path == "/models/loras":
+                return self._json(["style.safetensors", "sub/face.safetensors"])
+            if self.path == "/models/checkpoints":
+                return self._json(["base.safetensors"])
             self._json({}, 404)
 
         def do_POST(self):
@@ -143,6 +154,7 @@ def fake_comfy(monkeypatch):
 
     from comfy_gen import storage
     monkeypatch.setattr(storage, "upload_output", lambda data, filename, **kw: f"https://s3.example/{filename}")
+    monkeypatch.setattr(worker, "_s3_configured", lambda: True)
     yield state
     httpd.shutdown()
     httpd.server_close()
@@ -264,7 +276,9 @@ def _call(url: str, method: str = "GET", body: dict | None = None, token: str | 
 
 
 def test_server_routes(pod_server):
-    assert _call(f"{pod_server}/health", token=None) == (200, {"ok": True, "comfyui": worker.COMFYUI_BASE_URL})
+    assert _call(f"{pod_server}/health", token=None) == (
+        200, {"ok": True, "status": "healthy", "comfyui": worker.COMFYUI_BASE_URL},
+    )
     assert _call(f"{pod_server}/status/x", token=None)[0] == 401
     assert _call(f"{pod_server}/status/x", token="wrong")[0] == 401
     assert _call(f"{pod_server}/status/x")[0] == 404
@@ -303,3 +317,110 @@ def test_cli_client_against_pod_server(pod_server, monkeypatch, tmp_path):
     st = serverless.status(result["job_id"])
     assert st["status"] == "completed"
     assert serverless.cancel(result["job_id"])["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Outputs without S3, uploads, inventory (BlockFlow persistent-server API)
+# ---------------------------------------------------------------------------
+
+def test_job_completes_without_s3(fake_comfy, monkeypatch):
+    monkeypatch.setattr(worker, "_s3_configured", lambda: False)
+    env = _wait(worker.submit(SAVE_WORKFLOW, poll_interval=0.05)["id"])
+    assert env["status"] == "COMPLETED", env
+    out = env["output"]["output"]
+    assert "url" not in out and "urls" not in out
+    assert out["files"] == [{
+        "index": 0, "filename": "out_00001_.png", "node_id": "2", "kind": "images", "media_type": "image",
+    }]
+    assert worker.output_file(env["id"], 0) == (b"PNGDATA", "image/png", "out_00001_.png")
+    assert worker.output_file(env["id"], 1) is None
+
+
+def test_output_file_not_ready(fake_comfy):
+    job_id = worker.submit({"1": {"class_type": "Hang", "inputs": {}}}, poll_interval=0.05)["id"]
+    with pytest.raises(worker.OutputNotReady):
+        worker.output_file(job_id, 0)
+    worker.cancel(job_id)
+
+
+def test_media_type():
+    assert worker._media_type("clip.MP4", "gifs") == "video"
+    assert worker._media_type("a.png", "images") == "image"
+    assert worker._media_type("voice.wav", "audio") == "audio"
+
+
+def test_uploaded_descriptor_is_used_without_reupload(fake_comfy):
+    job = worker.submit(
+        SAVE_WORKFLOW,
+        file_inputs={"1": {"name": "abc_ref.png", "subfolder": "sub", "field": "image"}},
+        poll_interval=0.05,
+    )
+    assert _wait(job["id"])["status"] == "COMPLETED"
+    (prompt,) = fake_comfy.prompts.values()
+    assert prompt["1"]["inputs"]["image"] == "sub/abc_ref.png"
+    assert fake_comfy.uploads == []
+
+
+def test_inventory(fake_comfy):
+    inv = worker.inventory()
+    assert inv["ok"] is True
+    assert inv["samplers"] == ["euler", "dpmpp_2m"]
+    assert inv["schedulers"] == ["normal", "karras"]
+    assert inv["models"]["loras"] == ["style.safetensors", "sub/face.safetensors"]
+    assert inv["models"]["checkpoints"] == ["base.safetensors"]
+
+
+def _raw(url: str, method: str = "GET", data: bytes | None = None, headers: dict | None = None):
+    req = urllib.request.Request(
+        url, data=data, method=method, headers={"Authorization": "Bearer secret", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read(), resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), e.headers.get("Content-Type", "")
+
+
+def test_server_blockflow_routes(pod_server, fake_comfy, monkeypatch):
+    monkeypatch.setattr(worker, "_s3_configured", lambda: False)
+
+    # upload
+    code, body, _ = _raw(f"{pod_server}/upload/image", "PUT", b"IMGBYTES",
+                         {"Content-Type": "application/octet-stream", "X-Filename": "ref.png"})
+    assert code == 200
+    uploaded = json.loads(body)
+    assert uploaded["field"] == "image" and uploaded["name"].endswith("_ref.png")
+    assert fake_comfy.uploads and b"IMGBYTES" in fake_comfy.uploads[0][1]
+    assert _raw(f"{pod_server}/upload/audio", "PUT", b"x")[0] == 400
+    assert _raw(f"{pod_server}/upload/image", "PUT", b"", {"X-Filename": "e.png"})[0] == 400
+
+    # run + outputs
+    code, resp = _call(f"{pod_server}/run", "POST", {"input": {
+        "workflow": SAVE_WORKFLOW, "file_inputs": {"1": uploaded}, "poll_interval": 0.05,
+    }})
+    assert code == 200
+    env = _wait(resp["id"])
+    assert env["status"] == "COMPLETED"
+    code, data, ctype = _raw(f"{pod_server}/outputs/{resp['id']}/0")
+    assert (code, data, ctype) == (200, b"PNGDATA", "image/png")
+    assert _raw(f"{pod_server}/outputs/{resp['id']}/5")[0] == 404
+    assert _raw(f"{pod_server}/outputs/{resp['id']}/x")[0] == 400
+    assert _raw(f"{pod_server}/outputs/nope/0")[0] == 404
+
+    # inventory
+    code, inv = _call(f"{pod_server}/inventory")
+    assert code == 200 and inv["ok"] is True and inv["models"]["loras"]
+
+    # cancel with a JSON body: reply must not carry an "error" key
+    hang = _call(f"{pod_server}/run", "POST", {"input": {
+        "workflow": {"1": {"class_type": "Hang", "inputs": {}}}, "poll_interval": 0.05,
+    }})[1]
+    code, cancelled = _call(f"{pod_server}/cancel", "POST", {"job_id": hang["id"]})
+    assert code == 200 and cancelled == {"ok": True, "id": hang["id"], "status": "CANCELLED"}
+    assert _raw(f"{pod_server}/outputs/{hang['id']}/0")[0] == 409
+    assert _call(f"{pod_server}/cancel", "POST", {"job_id": "nope"})[0] == 404
+    assert _call(f"{pod_server}/cancel", "POST", {})[0] == 400
+
+    # auth still enforced on the new routes
+    assert _call(f"{pod_server}/inventory", token=None)[0] == 401
+    assert _raw(f"{pod_server}/outputs/{resp['id']}/0", headers={"Authorization": "Bearer wrong"})[0] == 401

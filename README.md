@@ -14,8 +14,13 @@ The `comfy-gen` CLI talks to it unchanged once `api_base_url` points at the pod.
 comfy-gen submit ──HTTPS──> server.py :8000 (on the pod) ──HTTP──> ComfyUI :8188
                                 │                                      │
                                 └── worker.py: queue, poll, cancel ────┘
-                                    outputs uploaded to S3 → pre-signed URL
+                                    outputs served at /outputs/<id>/<index>
+                                    (and uploaded to S3 → pre-signed URL, if configured)
 ```
+
+S3 is optional in pod mode. Without it, outputs are only available through
+`GET /outputs/<id>/<index>`, which is what BlockFlow uses; `comfy-gen submit`
+needs S3 to return output URLs.
 
 `worker.py` uses ComfyUI's HTTP API (`/prompt`, `/queue`, `/history`, `/view`,
 `/upload/image`, `/interrupt`). No extra SDK is needed.
@@ -65,9 +70,23 @@ The volume/model commands (`download`, `list`, `hash`, `object_info`, `info`,
 | `POST /runsync` | Same body. Waits up to 90s and returns the job envelope |
 | `GET /status/<id>` | `{"id", "status", "output", "error", "delayTime", "executionTime"}` |
 | `POST /cancel/<id>` | Removes the prompt from ComfyUI's queue, or interrupts it if it is running |
-| `GET /health` | No auth. Returns 503 if ComfyUI is unreachable |
+| `POST /cancel` | Same, with `{"job_id": "<id>"}` in the body → `{"ok", "id", "status"}` |
+| `PUT /upload/<image\|video>` | Raw file bytes, file name in the `X-Filename` header. Stores it in ComfyUI's input folder → `{"name", "subfolder", "field"}`; pass that object as a `file_inputs` entry |
+| `GET /outputs/<id>/<index>` | The bytes of a completed job's output (`index` from `output.files[].index`). 409 while the job is not completed |
+| `GET /inventory` | `{"ok", "samplers", "schedulers", "models": {"loras": [...], "checkpoints": [...], ...}}` from ComfyUI |
+| `GET /health` | No auth. `{"ok", "status": "healthy"\|"unhealthy", "comfyui"}`, 503 if ComfyUI is unreachable |
 
 Every route also accepts the RunPod prefix `/v2/<endpoint_id>/...` (the ID is ignored).
+`COMFYGEN_MAX_UPLOAD_MB` caps `/upload` bodies (default 1024).
+
+### Use with BlockFlow
+
+BlockFlow can send ComfyGen jobs to this server instead of RunPod serverless. In BlockFlow,
+attach a persistent ComfyGen server with the pod URL (`https://<pod_id>-<port>.proxy.runpod.net`)
+and `COMFYGEN_API_TOKEN` as the bearer token. BlockFlow uses `/health`, `/inventory`,
+`/upload`, `/run`, `/status`, `/outputs` and `/cancel`, and downloads results directly from
+the pod, so S3 is not needed. BlockFlow's Models and LoRA pages still require a serverless
+endpoint; manage model files on the pod itself.
 Jobs are held in memory: restarting `server.py` forgets them, and finished jobs are
 dropped after `COMFY_GEN_JOB_TTL` seconds (default 3600).
 

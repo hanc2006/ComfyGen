@@ -9,10 +9,19 @@ Routes (the /v2/<endpoint_id> prefix is optional and the ID is ignored):
   POST /run                 -> {"id", "status"}
   POST /runsync             -> job envelope once finished (or still running after --runsync-timeout)
   GET  /status/<job_id>     -> {"id", "status", "output", "error", "delayTime", "executionTime"}
-  POST /cancel/<job_id>
-  GET  /health              -> unauthenticated; 503 if ComfyUI is unreachable
+  POST /cancel/<job_id>     -> job envelope
+  GET  /health              -> unauthenticated; {"ok", "status": "healthy"|"unhealthy", "comfyui"}, 503 if ComfyUI is down
+
+BlockFlow "persistent ComfyGen server" routes:
+  POST /cancel              {"job_id"} -> {"ok", "id", "status"}
+  PUT  /upload/<image|video>  raw bytes, X-Filename header -> {"name", "subfolder", "field"}
+  GET  /outputs/<job_id>/<index>  -> the output file's bytes (index from output.files[].index)
+  GET  /inventory           -> {"ok", "samplers", "schedulers", "models": {"loras": [...], ...}}
 
 Every route except /health requires `Authorization: Bearer $COMFYGEN_API_TOKEN`.
+
+Environment:
+  COMFYGEN_MAX_UPLOAD_MB    Largest accepted /upload body in MB (default 1024)
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from urllib.parse import urlsplit
 import worker
 
 MAX_BODY_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("COMFYGEN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 RUNSYNC_TIMEOUT_SECONDS = 90
 
 
@@ -89,6 +99,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, body: bytes, content_type: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        safe_name = filename.replace('"', "_").replace("\r", "").replace("\n", "")
+        self.send_header("Content-Disposition", f'inline; filename="{safe_name}"')
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_error(self, message: str, status: int) -> None:
         self._send_json({"error": message}, status)
 
@@ -109,6 +128,34 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         return json.loads(raw) if raw else {}
 
+    def _read_upload(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_UPLOAD_BYTES:
+            raise ValueError(f"Upload too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+        return self.rfile.read(length) if length else b""
+
+    def _handle_upload(self, field_name: str) -> None:
+        filename = (self.headers.get("X-Filename") or "").strip() or f"upload.{'mp4' if field_name == 'video' else 'png'}"
+        data = self._read_upload()
+        self._send_json(worker.upload_file(field_name, data, filename))
+
+    def _handle_output(self, job_id: str, index_text: str) -> None:
+        try:
+            index = int(index_text)
+        except ValueError:
+            self._send_error(f"Invalid output index: {index_text}", 400)
+            return
+        try:
+            result = worker.output_file(job_id, index)
+        except worker.OutputNotReady as exc:
+            self._send_error(str(exc), 409)
+            return
+        if result is None:
+            self._send_error(f"Unknown job or output: {job_id}/{index}", 404)
+            return
+        data, content_type, filename = result
+        self._send_bytes(data, content_type, filename)
+
     def _send_job(self, env: dict[str, Any] | None, job_id: str) -> None:
         if env is None:
             self._send_error(f"Unknown job: {job_id}", 404)
@@ -119,14 +166,50 @@ class Handler(BaseHTTPRequestHandler):
         parts = _route(self.path)
         if parts == ["health"]:
             healthy = worker.comfyui_healthy()
-            self._send_json({"ok": healthy, "comfyui": worker.COMFYUI_BASE_URL}, 200 if healthy else 503)
+            # BlockFlow's attach check requires ok=True and status="healthy".
+            self._send_json(
+                {
+                    "ok": healthy,
+                    "status": "healthy" if healthy else "unhealthy",
+                    "comfyui": worker.COMFYUI_BASE_URL,
+                },
+                200 if healthy else 503,
+            )
             return
         if not self._authorized():
             return
-        if len(parts) == 2 and parts[0] == "status":
-            self._send_job(worker.status(parts[1]), parts[1])
+        try:
+            if len(parts) == 2 and parts[0] == "status":
+                self._send_job(worker.status(parts[1]), parts[1])
+                return
+            if len(parts) == 3 and parts[0] == "outputs":
+                self._handle_output(parts[1], parts[2])
+                return
+            if parts == ["inventory"]:
+                self._send_json(worker.inventory())
+                return
+        except Exception as exc:
+            self.log_error("unhandled error on %s: %r", self.path, exc)
+            self._send_error(f"Internal error: {exc}", 500)
             return
         self._send_error(f"Unsupported GET path: {self.path}", 404)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return
+        parts = _route(self.path)
+        try:
+            if len(parts) == 2 and parts[0] == "upload":
+                self._handle_upload(parts[1])
+                return
+        except ValueError as exc:
+            self._send_error(str(exc), 400)
+            return
+        except Exception as exc:
+            self.log_error("unhandled error on %s: %r", self.path, exc)
+            self._send_error(f"Internal error: {exc}", 500)
+            return
+        self._send_error(f"Unsupported PUT path: {self.path}", 404)
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
@@ -142,6 +225,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 2 and parts[0] == "cancel":
                 self._send_job(worker.cancel(parts[1]), parts[1])
+                return
+            if parts == ["cancel"]:
+                # BlockFlow form: job ID in the body. No "error" key in the reply,
+                # because BlockFlow treats any "error" key as a failed request.
+                body = self._read_json()
+                job_id = str(body.get("job_id") or body.get("id") or "") if isinstance(body, dict) else ""
+                if not job_id:
+                    raise ValueError("Missing 'job_id'")
+                env = worker.cancel(job_id)
+                if env is None:
+                    self._send_error(f"Unknown job: {job_id}", 404)
+                else:
+                    self._send_json({"ok": True, "id": job_id, "status": env["status"]})
+                return
+            if len(parts) == 2 and parts[0] == "upload":
+                self._handle_upload(parts[1])
                 return
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_error(str(exc), 400)

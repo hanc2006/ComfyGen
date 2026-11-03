@@ -7,7 +7,9 @@ started once and kept alive; this module talks to it over its HTTP API:
   POST /prompt         queue the workflow
   GET  /queue          tell pending vs running
   GET  /history/<id>   detect completion / execution errors
-  GET  /view           fetch output files (then uploaded to S3)
+  GET  /view           fetch output files (uploaded to S3 when configured,
+                       and served directly by server.py's /outputs route)
+  GET  /object_info, /models/<folder>   inventory (samplers, schedulers, models)
   POST /queue {delete} / POST /interrupt   cancel
 
 Job state is kept in memory and exposed in the RunPod job envelope format
@@ -18,7 +20,8 @@ Environment:
   COMFYUI_BASE_URL        ComfyUI address (default http://127.0.0.1:8188)
   COMFY_GEN_JOB_TIMEOUT   Default job timeout in seconds (default 1200)
   COMFY_GEN_JOB_TTL       Seconds finished jobs are kept for status (default 3600)
-  AWS_* / S3_*            Output storage, see comfy_gen/storage.py
+  AWS_* / S3_*            Optional output storage, see comfy_gen/storage.py.
+                          Without it, outputs are only available via /outputs.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -48,6 +52,10 @@ CLIENT_ID = uuid.uuid4().hex
 
 TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"})
 OUTPUT_KINDS = ("images", "gifs", "videos", "audio")
+UPLOAD_FIELDS = ("image", "video")
+VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"})
+AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"})
+INVENTORY_MODEL_FOLDERS = ("loras", "checkpoints", "diffusion_models", "vae", "text_encoders", "upscale_models")
 
 _JOBS: dict[str, "Job"] = {}
 _LOCK = threading.Lock()
@@ -64,6 +72,8 @@ class Job:
     status: str = "IN_QUEUE"
     prompt_id: str | None = None
     output: dict[str, Any] | None = None
+    # ComfyUI locations of the outputs, in /outputs/<job_id>/<index> order.
+    output_files: list[dict[str, str]] = field(default_factory=list)
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -115,8 +125,8 @@ def comfyui_healthy() -> bool:
         return False
 
 
-def _upload_input(data: bytes, filename: str) -> str:
-    """Upload a file into ComfyUI's input directory. Returns the name to put in the node."""
+def _upload_to_comfyui(data: bytes, filename: str) -> tuple[str, str]:
+    """Upload a file into ComfyUI's input directory. Returns (name, subfolder)."""
     boundary = uuid.uuid4().hex
     safe_name = Path(filename).name.replace('"', "_") or "input"
     parts = [
@@ -133,7 +143,17 @@ def _upload_input(data: bytes, filename: str) -> str:
     name = resp.get("name")
     if not name:
         raise RuntimeError(f"ComfyUI /upload/image returned no name: {resp!r}")
-    subfolder = resp.get("subfolder") or ""
+    return name, resp.get("subfolder") or ""
+
+
+def _content_addressed_name(data: bytes, filename: str) -> str:
+    # Content-addressed name so concurrent jobs never clobber each other's inputs.
+    return f"{hashlib.md5(data).hexdigest()[:12]}_{Path(filename).name or 'input'}"
+
+
+def _upload_input(data: bytes, filename: str) -> str:
+    """Upload a file into ComfyUI's input directory. Returns the name to put in the node."""
+    name, subfolder = _upload_to_comfyui(data, _content_addressed_name(data, filename))
     return f"{subfolder}/{name}" if subfolder else name
 
 
@@ -232,18 +252,59 @@ def _apply_file_inputs(workflow: dict[str, Any], file_inputs: dict[str, Any]) ->
         node = workflow.get(str(node_id))
         if not isinstance(node, dict):
             raise ValueError(f"File input targets unknown node {node_id}")
+        if isinstance(spec, dict) and spec.get("name") and not (spec.get("url") or spec.get("local_path") or spec.get("path")):
+            # Already in ComfyUI's input dir via upload_file() (BlockFlow sends
+            # the {"name", "subfolder", "field"} descriptor /upload returned).
+            name = str(spec["name"])
+            subfolder = str(spec.get("subfolder") or "").strip("/")
+            node.setdefault("inputs", {})[spec.get("field") or "image"] = f"{subfolder}/{name}" if subfolder else name
+            continue
         field_name, data, filename = _read_file_input(node_id, spec)
-        # Content-addressed name so concurrent jobs never clobber each other's inputs.
-        digest = hashlib.md5(data).hexdigest()[:12]
-        name = _upload_input(data, f"{digest}_{Path(filename).name}")
-        node.setdefault("inputs", {})[field_name] = name
+        node.setdefault("inputs", {})[field_name] = _upload_input(data, filename)
+
+
+def _media_type(filename: str, kind: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in AUDIO_EXTENSIONS or kind == "audio":
+        return "audio"
+    return "image"
+
+
+def _s3_configured() -> bool:
+    """True when output storage credentials are available (config file or env)."""
+    try:
+        from comfy_gen.config import load
+        cfg = load()
+    except Exception:
+        return False
+    return all(cfg.get(k) for k in ("aws_access_key_id", "aws_secret_access_key", "s3_bucket"))
+
+
+def _view_query(item: dict[str, str]) -> str:
+    return urllib.parse.urlencode({
+        "filename": item["filename"],
+        "subfolder": item.get("subfolder", ""),
+        "type": item.get("type", "output"),
+    })
 
 
 def _collect_outputs(job: Job, entry: dict[str, Any]) -> dict[str, Any]:
-    """Fetch output files from ComfyUI, upload them to S3, build the handler output."""
-    from comfy_gen import storage
+    """Build the handler output for a finished prompt.
+
+    Every saved output gets an index; server.py serves it at
+    /outputs/<job_id>/<index> straight from ComfyUI. When S3 storage is
+    configured the files are also uploaded and their pre-signed URLs included
+    (the format `comfy-gen submit` expects); without it, "url"/"urls" are
+    omitted and /outputs is the only way to fetch them.
+    """
+    use_s3 = _s3_configured()
+    if use_s3:
+        from comfy_gen import storage
 
     files: list[dict[str, Any]] = []
+    locations: list[dict[str, str]] = []
     for node_id, node_out in (entry.get("outputs") or {}).items():
         if not isinstance(node_out, dict):
             continue
@@ -253,27 +314,35 @@ def _collect_outputs(job: Job, entry: dict[str, Any]) -> dict[str, Any]:
                     continue
                 if item.get("type") == "temp":  # PreviewImage etc.
                     continue
-                query = urllib.parse.urlencode({
-                    "filename": item["filename"],
-                    "subfolder": item.get("subfolder", ""),
-                    "type": item.get("type", "output"),
-                })
-                data = _http("GET", f"/view?{query}", timeout=300)
-                url = storage.upload_output(data, item["filename"])
-                files.append({"url": url, "filename": item["filename"], "node_id": node_id, "kind": kind})
+                location = {
+                    "filename": str(item["filename"]),
+                    "subfolder": str(item.get("subfolder") or ""),
+                    "type": str(item.get("type") or "output"),
+                }
+                info: dict[str, Any] = {
+                    "index": len(files),
+                    "filename": location["filename"],
+                    "node_id": node_id,
+                    "kind": kind,
+                    "media_type": _media_type(location["filename"], kind),
+                }
+                if use_s3:
+                    data = _http("GET", f"/view?{_view_query(location)}", timeout=300)
+                    info["url"] = storage.upload_output(data, location["filename"])
+                files.append(info)
+                locations.append(location)
 
     if not files:
         raise RuntimeError("Workflow finished but produced no saved outputs (add a SaveImage / video save node)")
 
-    return {
-        "ok": True,
-        "output": {
-            "url": files[0]["url"],
-            "urls": [f["url"] for f in files],
-            "files": files,
-            "prompt_id": job.prompt_id,
-        },
-    }
+    with _LOCK:
+        job.output_files = locations
+
+    output: dict[str, Any] = {"files": files, "prompt_id": job.prompt_id}
+    if use_s3:
+        output["url"] = files[0]["url"]
+        output["urls"] = [f["url"] for f in files]
+    return {"ok": True, "output": output}
 
 
 def _finish(job: Job, status: str, output: dict[str, Any] | None = None, error: str | None = None) -> bool:
@@ -417,3 +486,81 @@ def cancel(job_id: str) -> dict[str, Any] | None:
     if _finish(job, "CANCELLED", error="Cancelled by user") and prompt_id:
         _cancel_in_comfyui(prompt_id)
     return status(job_id)
+
+
+class OutputNotReady(Exception):
+    """The job exists but has not completed, so it has no outputs yet."""
+
+
+def output_file(job_id: str, index: int) -> tuple[bytes, str, str] | None:
+    """Return (data, content_type, filename) of a completed job's output.
+
+    None if the job or index is unknown; OutputNotReady if not completed yet.
+    The bytes are read from ComfyUI's output folder on each request.
+    """
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return None
+        if job.status != "COMPLETED":
+            raise OutputNotReady(f"Job {job_id} is {job.status}")
+        if not 0 <= index < len(job.output_files):
+            return None
+        location = dict(job.output_files[index])
+    data = _http("GET", f"/view?{_view_query(location)}", timeout=300)
+    content_type = mimetypes.guess_type(location["filename"])[0] or "application/octet-stream"
+    return data, content_type, location["filename"]
+
+
+def upload_file(field_name: str, data: bytes, filename: str) -> dict[str, str]:
+    """Upload a client file into ComfyUI's input folder ahead of a job.
+
+    Returns {"name", "subfolder", "field"}; pass it back in file_inputs (or put
+    "subfolder/name" in the node input) to use it.
+    """
+    if field_name not in UPLOAD_FIELDS:
+        raise ValueError(f"Upload field must be one of: {', '.join(UPLOAD_FIELDS)}")
+    if not data:
+        raise ValueError("Upload body is empty")
+    name, subfolder = _upload_to_comfyui(data, _content_addressed_name(data, filename))
+    return {"name": name, "subfolder": subfolder, "field": field_name}
+
+
+def _combo_options(object_info: dict[str, Any], node: str, input_name: str) -> list[str]:
+    """Read a COMBO input's choices from /object_info (old and new formats)."""
+    spec = (object_info.get(node, {}).get("input", {}).get("required", {}) or {}).get(input_name)
+    if not isinstance(spec, list) or not spec:
+        return []
+    if isinstance(spec[0], list):  # [["a", "b"], {...}]
+        return [str(v) for v in spec[0]]
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):  # ["COMBO", {"options": [...]}]
+        return [str(v) for v in spec[1].get("options") or []]
+    return []
+
+
+def inventory() -> dict[str, Any]:
+    """Samplers, schedulers and model files known to ComfyUI."""
+    object_info: dict[str, Any] = {}
+    for node in ("KSampler", "LoraLoader"):
+        try:
+            object_info.update(_http_json("GET", f"/object_info/{node}", timeout=30))
+        except Exception as exc:
+            _log(f"inventory: /object_info/{node} failed: {exc}")
+
+    models: dict[str, list[str]] = {}
+    for folder in INVENTORY_MODEL_FOLDERS:
+        try:  # /models/<folder> exists on current ComfyUI
+            listing = _http_json("GET", f"/models/{folder}", timeout=30)
+        except Exception:
+            continue
+        if isinstance(listing, list):
+            models[folder] = [str(v) for v in listing]
+    if "loras" not in models:  # older ComfyUI: fall back to LoraLoader's choices
+        models["loras"] = _combo_options(object_info, "LoraLoader", "lora_name")
+
+    return {
+        "ok": True,
+        "samplers": _combo_options(object_info, "KSampler", "sampler_name"),
+        "schedulers": _combo_options(object_info, "KSampler", "scheduler"),
+        "models": models,
+    }
