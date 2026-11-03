@@ -301,3 +301,33 @@ def test_models_dir_default_prefers_first_existing(monkeypatch, tmp_path):
 
 def test_default_models_dirs_start_with_workspace_models():
     assert pod_models.DEFAULT_MODELS_DIRS[0] == "/workspace/models"
+
+
+def test_list_models(models_root):
+    (models_root / "loras/sub").mkdir(parents=True)
+    (models_root / "loras/a.safetensors").write_bytes(b"x" * 10)
+    (models_root / "loras/sub/b.safetensors").write_bytes(b"y" * 3)
+    (models_root / "loras/c.safetensors.part").write_bytes(b"partial")
+    (models_root / "loras/.hidden").write_bytes(b"h")
+    res = pod_models.list_models(["loras", "vae"])
+    assert res["models_dir"] == str(models_root.resolve())
+    assert [(e["filename"], e["path"], e["size_bytes"]) for e in res["folders"]["loras"]] == [
+        ("a.safetensors", "loras/a.safetensors", 10),
+        ("sub/b.safetensors", "loras/sub/b.safetensors", 3),
+    ]
+    assert res["folders"]["vae"] == []
+    for bad in ([], ["../x"], ["a/b"], [""]):
+        with pytest.raises(ValueError):
+            pod_models.list_models(bad)
+
+
+def test_server_list_route(pod_server, models_root):
+    (models_root / "checkpoints").mkdir()
+    (models_root / "checkpoints/m.safetensors").write_bytes(b"m")
+    code, res = _call(f"{pod_server}/models/list?folders=checkpoints,loras")
+    assert code == 200
+    assert res["folders"]["checkpoints"][0]["path"] == "checkpoints/m.safetensors"
+    assert res["folders"]["loras"] == []
+    assert _call(f"{pod_server}/models/list")[0] == 400
+    assert _call(f"{pod_server}/models/list?folders=../etc")[0] == 400
+    assert _call(f"{pod_server}/models/list?folders=loras", token=None)[0] == 401

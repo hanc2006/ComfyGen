@@ -89,6 +89,7 @@ The volume/model commands (`download`, `list`, `hash`, `object_info`, `info`,
 | `POST /models/download/<id>/cancel` | Stops the download and removes the partial file |
 | `POST /models/delete` | `{"paths": ["loras/x.safetensors"]}` → `{"ok", "results": [{"path", "deleted"}]}` |
 | `GET /models/disk` | `{"models_dir", "total_bytes", "free_bytes"}` |
+| `GET /models/list?folders=loras,checkpoints` | Files per folder (recursive) → `{"models_dir", "folders": {"loras": [{"filename", "path", "size_bytes", "modified"}]}}`. Partial `.part` downloads are skipped |
 
 Every route also accepts the RunPod prefix `/v2/<endpoint_id>/...` (the ID is ignored).
 `COMFYGEN_MAX_UPLOAD_MB` caps `/upload` bodies (default 1024).
@@ -105,8 +106,8 @@ attach a persistent ComfyGen server with the pod URL (`https://<pod_id>-<port>.p
 and `COMFYGEN_API_TOKEN` as the bearer token. BlockFlow uses `/health`, `/inventory`,
 `/upload`, `/run`, `/status`, `/outputs` and `/cancel`, and downloads results directly from
 the pod, so S3 is not needed. Preset install and uninstall use the `/models/*` routes to
-download files straight into the pod's models folder. BlockFlow's Models and LoRA pages
-still require a serverless endpoint.
+download files straight into the pod's models folder. BlockFlow's Models and LoRA pages list,
+download and delete through the same `/models/*` routes.
 Jobs are held in memory: restarting `server.py` forgets them, and finished jobs are
 dropped after `COMFY_GEN_JOB_TTL` seconds (default 3600).
 

@@ -87,6 +87,45 @@ def resolve_dest(rel: str, root: Path | None = None) -> Path:
     return target
 
 
+def list_models(folders: list[str]) -> dict[str, Any]:
+    """Files under each requested models subfolder (recursive), with sizes.
+
+    filename is relative to the folder ("sub/x.safetensors"), path relative to
+    the models folder ("loras/sub/x.safetensors"). Missing folders list as [];
+    in-progress downloads (*.part) and hidden files are skipped.
+    """
+    root = models_dir()
+    if not isinstance(folders, list) or not folders:
+        raise ValueError("Give at least one folder, e.g. ?folders=loras,checkpoints")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for folder in folders:
+        folder = str(folder).strip()
+        if not folder or "/" in folder or "\\" in folder or folder in (".", ".."):
+            raise ValueError(f"Invalid folder name: {folder!r}")
+        base = root / folder
+        entries: list[dict[str, Any]] = []
+        if base.is_dir():
+            for path in sorted(base.rglob("*")):
+                rel_parts = path.relative_to(base).parts
+                if any(p.startswith(".") for p in rel_parts) or path.name.endswith(".part"):
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    continue
+                filename = "/".join(rel_parts)
+                entries.append({
+                    "filename": filename,
+                    "path": f"{folder}/{filename}",
+                    "size_bytes": stat.st_size,
+                    "modified": int(stat.st_mtime),
+                })
+        result[folder] = entries
+    return {"models_dir": str(root), "folders": result}
+
+
 def disk_usage() -> dict[str, Any]:
     root = models_dir()
     usage = shutil.disk_usage(root)

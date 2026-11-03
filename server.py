@@ -25,6 +25,8 @@ Model files (see pod_models.py; paths are relative to the ComfyUI models folder)
   POST /models/download/<id>/cancel
   POST /models/delete       {"paths": ["loras/x.safetensors", ...]} -> {"ok", "results": [...]}
   GET  /models/disk         -> {"models_dir", "total_bytes", "free_bytes"}
+  GET  /models/list?folders=loras,checkpoints
+                            -> {"models_dir", "folders": {"loras": [{"filename", "path", "size_bytes", "modified"}]}}
 
 Every route except /health requires `Authorization: Bearer $COMFYGEN_API_TOKEN`.
 
@@ -41,7 +43,7 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pod_models
 import worker
@@ -199,6 +201,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parts == ["models", "disk"]:
                 self._send_json(pod_models.disk_usage())
+                return
+            if parts == ["models", "list"]:
+                query = parse_qs(urlsplit(self.path).query)
+                folders = [f for value in query.get("folders", []) for f in value.split(",") if f.strip()]
+                try:
+                    self._send_json(pod_models.list_models(folders))
+                except ValueError as exc:
+                    self._send_error(str(exc), 400)
                 return
             if len(parts) == 3 and parts[:2] == ["models", "download"]:
                 status = pod_models.download_status(parts[2])
